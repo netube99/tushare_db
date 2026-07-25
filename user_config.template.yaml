@@ -1,0 +1,36 @@
+# tushare_db 配置文件
+# 复制本文件为 user_config.yaml 并填写你的配置
+
+# Tushare token（https://tushare.pro 注册获取）
+tushare_token: <your_token>
+
+# Tushare 积分（决定可用接口，5000 可用大部分标准接口）
+tushare_points: 5000
+
+# Tushare 频率限制（次/分钟，按 token 全局计）
+# 费率规则：
+#   积分 < 5000  → 200 次/分钟
+#   积分 >= 5000 → 500 次/分钟
+tushare_rate_limit: 500
+
+# 规则 2（低频）接口最小间隔（毫秒）
+tushare_interval_r2_ms: 2000
+
+# 建库起始日期（YYYYMMDD）
+backfill_since: '20230101'
+
+# 收盘数据可用时间（HH:MM，北京时间），此前 until=昨天，此后 until=今天
+pull_after: '20:30'
+
+# HTTP 代理：null=裸连，'__use_system__'=走系统代理，或填 'http://host:port'
+tushare_proxy: '__use_system__'
+
+# 不纳入 REGISTRY 的接口（用户手动排除）
+# 示例：
+#   - stk_factor        # 与 stk_factor_pro 重叠
+#   - daily             # stk_factor_pro 已覆盖 OHLCV
+#   - adj_factor        # stk_factor_pro 已包含复权因子
+#   - express           # 需 ts_code 逐票拉，用 express_vip 批量
+#   - balancesheet      # 资产负债表，暂不需要
+#   - income            # 利润表，暂不需要
+exclude_apis: []

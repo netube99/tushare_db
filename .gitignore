@@ -1,0 +1,19 @@
+# 用户数据与缓存
+data/
+cache/
+logs/
+
+# 配置文件（含 token）
+user_config.yaml
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+
+# 测试
+.pytest_cache/
+
+# IDE / AI 工具
+.claude/
+.aider.tags.cache.v4/

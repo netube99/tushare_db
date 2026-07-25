@@ -1,0 +1,14 @@
+[project]
+name = "tushare-db"
+version = "1.0.0"
+description = "A 股全量数据管道 — Tushare → SQLite"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.28",
+    "pyyaml>=6.0",
+    "numpy>=2.4.6",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
