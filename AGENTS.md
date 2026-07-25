@@ -344,7 +344,7 @@ tests/test_regression.py     — 4  回归护栏（TABLE_SPECS 键名一致性�
 
 ## 风格
 
-- Python ≥ 3.11，uv 管理依赖
+- Python ≥ 3.12，uv 管理依赖
 - 类型标注使用，docstring 最小化
 - 代码与注释中不使用 emoji
 - 修改任何文件后检查是否影响 `AGENTS.md`

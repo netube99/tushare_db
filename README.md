@@ -77,13 +77,13 @@ python scripts/convert_to_qlib.py --table stk_factor_pro  # 仅转换指定表
 | 增量续跑 | `pull_log` 表记录状态 (ok=0/1/2/3)，中断自动续跑 |
 | 天级限流冷却 | 触发 40203 后 24h 冷却，持久化到磁盘，跨进程生效 |
 | 收盘时间门禁 | `pull_after` 配置（默认 20:30），自动判定 until 日期 |
-| Qlib 转换 | 31 张表、570+ 字段自动映射为 Qlib bin 格式 |
+| Qlib 转换 | SQLite 自动映射为 Qlib bin 格式，字段映射由 TABLE_SPECS 驱动 |
 | 中断续转 | `bin_sync_log` 记录同步状态，中断后跳过已完成项 |
 | 指数成分股 | 从 `index_weight` 生成各指数成分股存续期清单 |
 
 ---
 
-## 接口分级
+## 接口积分规则
 
 接口按 Tushare 积分和频率限制自动分类：
 
@@ -95,6 +95,9 @@ python scripts/convert_to_qlib.py --table stk_factor_pro  # 仅转换指定表
 | 6 | 专属付费 | ❌ | ❌ |
 
 排除逻辑：`ts_code` 必选（无法批量拉全市场）、小时/天级限流、`exclude_apis` 列表。
+
+Tushare 积分不足时不等于接口完全不可用，低积分用户通常仍保留少量日调用配额。对于单次请求即可覆盖全量的接口，可在额度内完成拉取，`api_index.json` 中手动标记 overdraft 后自动纳入建表拉取项。
+`api_index.json` 是 Tushare 接口的关键索引文件，非特殊情况不建议修改此文件的内容。
 
 ---
 
