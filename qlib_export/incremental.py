@@ -58,7 +58,8 @@ class IncrementalSync:
             existing_insts = {r["instrument"] for r in records}
             all_insts = get_instruments_for_table(self.conn, table_cfg)
 
-            for inst in all_insts:
+            n_all = len(all_insts)
+            for i, inst in enumerate(all_insts):
                 if inst not in existing_insts:
                     try:
                         # 全量首转必须忽略 since（--since 仅供全量调试截断用）
@@ -78,7 +79,14 @@ class IncrementalSync:
                         if not quiet:
                             print(f"  [ERROR] new {inst} ← {source_table}: {e}")
 
-            for record in records:
+                if not quiet and (i + 1) % 100 == 0:
+                    print(f"  [{source_table}] scan {i+1}/{n_all}")
+
+            n_records = len(records)
+            for j, record in enumerate(records):
+                if not quiet and (j + 1) % 100 == 0:
+                    print(f"  [{source_table}] sync {j+1}/{n_records}")
+
                 inst = record["instrument"]
                 last_date = record["last_date"]
                 first_date = record.get("first_date", "")
@@ -294,7 +302,11 @@ class FieldRebuilder:
                 continue
 
             instruments = get_instruments_for_table(self.conn, table_cfg)
-            for inst in instruments:
+            n_total = len(instruments)
+            for i, inst in enumerate(instruments):
+                if (i + 1) % 100 == 0:
+                    print(f"  [{source_table}] rebuild {i+1}/{n_total}")
+
                 inst_dir = self.output_dir / "features" / inst.lower()
                 for fname in targets:
                     bin_path = inst_dir / f"{fname}.day.bin"

@@ -221,6 +221,7 @@ def main() -> None:
                 shutil.rmtree(output_dir)
             clear_all_sync_log(conn)
 
+        print("[1/3] 初始化日历和品种清单...")
         calendar = CalendarSync(output_dir)
         old_calendar = calendar.load_old_calendar() if args.daily else None
         if args.daily:
@@ -302,7 +303,7 @@ def _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output
             field_names = json.loads(p["fields_json"])
             feature_sync._cleanup_partial_bins(p["instrument"], field_names)
 
-    print("初始化品种清单...")
+    print("[1/3] 初始化品种清单...")
     inst_sync.full_init(conn)
 
     print("生成指数成分股清单...")
@@ -310,14 +311,14 @@ def _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output
     idx_constituent_sync.full_sync(conn)
 
     t_start = time.time()
-    print(f"\n开始全量转换 ({len(conversion_tables)} 张表)...")
+    print(f"\n[2/3] 开始全量转换 ({len(conversion_tables)} 张表)...")
     stats = feature_sync.full_convert(conversion_tables)
     elapsed = time.time() - t_start
 
     print(f"\n全量转换完成: {elapsed:.0f}s")
     print(f"  instruments: {stats['total_instruments']} (written: {stats['total_written']}, skipped: {stats['total_skipped']})")
 
-    print("生成 features_manifest.json...")
+    print("[3/3] 生成 features_manifest.json...")
     manifest = build_features_manifest(conversion_tables, calendar)
     manifest["_meta"]["total_instruments"] = stats["total_written"]
     write_manifest(output_dir, manifest)
@@ -327,7 +328,7 @@ def _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output
 def _cmd_daily(conn, conversion_tables, calendar, inst_sync, feature_sync, output_dir,
                old_calendar=None):
     """每日增量同步（日历由 daily_sync 全量重建）."""
-    print("执行增量同步...")
+    print("[2/3] 执行增量同步...")
     inc_sync = IncrementalSync(output_dir, calendar, conn, feature_sync)
     t_start = time.time()
     stats = inc_sync.daily_sync(conversion_tables, old_calendar=old_calendar)
@@ -341,7 +342,7 @@ def _cmd_daily(conn, conversion_tables, calendar, inst_sync, feature_sync, outpu
     idx_constituent_sync = IndexConstituentSync(output_dir)
     idx_constituent_sync.full_sync(conn)
 
-    print("更新 features_manifest.json...")
+    print("[3/3] 更新 features_manifest.json...")
     manifest = build_features_manifest(conversion_tables, calendar)
     write_manifest(output_dir, manifest)
 

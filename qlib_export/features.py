@@ -32,6 +32,9 @@ class FeatureSync:
         total_written = 0
         total_skipped = 0
 
+        overall_total = sum(len(get_instruments_for_table(self.conn, t)) for t in conversion_tables)
+        overall_done = 0
+
         for table_cfg in conversion_tables:
             source_table = table_cfg["source_table"]
             instruments = get_instruments_for_table(self.conn, table_cfg)
@@ -40,6 +43,7 @@ class FeatureSync:
             n_total = len(instruments)
             for i, inst in enumerate(instruments):
                 total_instruments += 1
+                overall_done += 1
                 if is_synced(self.conn, inst, source_table, field_names):
                     total_skipped += 1
                     continue
@@ -67,8 +71,7 @@ class FeatureSync:
                         print(f"  [ERROR] {inst} ← {source_table}: {e}")
 
                 if not quiet and (i + 1) % 100 == 0:
-                    pct = 100 * (i + 1) / n_total
-                    print(f"  [{source_table}] {i+1}/{n_total} ({pct:.1f}%)")
+                    print(f"  [{source_table}] {i+1}/{n_total}  overall {overall_done}/{overall_total}")
 
         from database.logger import get_json_logger
         get_json_logger().write({
