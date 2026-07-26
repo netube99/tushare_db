@@ -3,6 +3,7 @@ name = "tushare-db"
 version = "1.0.0"
 description = "A 股全量数据管道 — Tushare → SQLite"
 requires-python = ">=3.12"
+license = { text = "MIT" }
 dependencies = [
     "pandas>=2.0",
     "requests>=2.28",
