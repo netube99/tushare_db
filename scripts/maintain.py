@@ -422,7 +422,7 @@ def _get_date_periods(conn, date_mode: str, since: str | None, until: str | None
 
 
 def _find_domain_param(entry: dict) -> str | None:
-    """找出唯一的 required 非日期/分页参数名."""
+    """找出唯一的 required 非日期/分页参数名（含 force_required 覆盖）."""
     DATE_PAGINATION = {
         "trade_date", "start_date", "end_date", "ann_date",
         "freq", "offset", "limit", "fields",
@@ -431,8 +431,9 @@ def _find_domain_param(entry: dict) -> str | None:
     api_list = load_api_registry()
     for api in api_list:
         if api["api_name"] == entry["api"]:
+            fixes = _apply_param_fixes(api)
             candidates = [p["name"] for p in api.get("input_params", [])
-                         if p.get("required") and p["name"] not in DATE_PAGINATION]
+                         if fixes["is_required"](p["name"]) and p["name"] not in DATE_PAGINATION]
             return candidates[0] if candidates else None
     return None
 

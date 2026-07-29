@@ -114,6 +114,8 @@ exclude_apis:
   - stk_week_month_adj          # 周月线复权行情(每日更新)
   - stk_weekly_monthly          # 股票周/月线行情(每日更新)
   - suspend_d                   # 每日停复牌信息
+  - top10_floatholders          # 前十大流通股东，暂不需要
+  - top10_holders               # 前十大股东，暂不需要
   - us_basic                    # 美股基础信息
   - us_tbr                      # 短期国债利率
   - us_tltr                     # 国债长期利率

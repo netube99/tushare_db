@@ -6627,13 +6627,18 @@
       },
       "driver": {
         "values": [
+          "000016.SH",
           "000300.SH",
-          "000905.SH",
           "000852.SH",
-          "000985.SH",
-          "399006.SZ",
+          "000903.SH",
+          "000905.SH",
           "000906.SH",
-          "399303.SZ"
+          "399001.SZ",
+          "399006.SZ",
+          "399303.SZ",
+          "399330.SZ",
+          "399673.SZ",
+          "000985.CSI"
         ],
         "date_mode": "monthly"
       },
@@ -7841,7 +7846,7 @@
       {
         "name": "ts_code",
         "type": "str",
-        "required": true,
+        "required": false,
         "description": "指数代码，来源指数基础信息接口"
       },
       {
@@ -7923,11 +7928,30 @@
     "usage_example": "pro = ts.pro_api()\n\ndf = pro.index_daily(ts_code='399300.SZ')\n\n#或者按日期取\n\ndf = pro.index_daily(ts_code='399300.SZ', start_date='20180101', end_date='20181010')",
     "sample_data": "            ts_code trade_date      close       open       high        low  \\\n0     399300.SZ   20180903  3321.8248  3320.6898  3325.6070  3291.7842   \n1     399300.SZ   20180831  3334.5036  3333.3801  3356.5757  3310.8726   \n2     399300.SZ   20180830  3351.0942  3385.8052  3402.5626  3349.4688   \n3     399300.SZ   20180829  3386.5736  3393.0527  3398.7139  3377.1231   \n4     399300.SZ   20180828  3400.1705  3408.1502  3416.5929  3388.8143   \n5     399300.SZ   20180827  3406.5735  3339.3894  3406.5735  3339.2646   \n6     399300.SZ   20180824  3325.3347  3308.4778  3353.0445  3291.8654   \n7     399300.SZ   20180823  3320.0257  3308.4589  3336.1123  3285.8141   \n8     399300.SZ   20180822  3307.9545  3328.9693  3328.9693  3299.3938   \n9     399300.SZ   20180821  3326.6489  3271.8402  3331.7077  3270.0302",
     "doc_url": "https://tushare.pro/wctapi/documents/95.md",
-    "bulk_note": "ts_code必填，不能批量拉全市场指数",
+    "bulk_note": "ts_code选填，domain策略精选核心指数",
     "_project": {
       "param_fixes": {
-        "force_required": [],
+        "force_required": [
+          "index_daily.ts_code"
+        ],
         "force_disabled": []
+      },
+      "driver": {
+        "values": [
+          "000001.SH",
+          "000016.SH",
+          "000300.SH",
+          "000852.SH",
+          "000903.SH",
+          "000905.SH",
+          "000906.SH",
+          "399001.SZ",
+          "399006.SZ",
+          "399303.SZ",
+          "399330.SZ",
+          "399673.SZ"
+        ],
+        "date_mode": "daily"
       }
     }
   },
@@ -11137,7 +11161,7 @@
       {
         "name": "ts_code",
         "type": "str",
-        "required": true,
+        "required": false,
         "description": "TS代码"
       },
       {
@@ -11363,7 +11387,7 @@
       {
         "name": "ts_code",
         "type": "str",
-        "required": true,
+        "required": false,
         "description": "TS代码"
       },
       {

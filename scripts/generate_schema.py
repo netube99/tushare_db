@@ -41,20 +41,20 @@ def infer_pk(api: dict, driver: dict | None = None) -> str | None:
     if driver:
         param_name = None
         for p in api.get("input_params", []):
-            if p.get("required") and p["name"] not in (
+            force_req = api.get("_project", {}).get("param_fixes", {}).get("force_required", [])
+            api_fq = api.get("api_name", "") + "." + p["name"]
+            if (p.get("required") or api_fq in force_req) and p["name"] not in (
                 "trade_date", "start_date", "end_date", "ann_date",
                 "freq", "offset", "limit",
             ):
                 param_name = p["name"]
                 break
-        pk_cols = []
         if param_name and param_name in names:
-            pk_cols.append(param_name)
-        if "con_code" in names:
-            pk_cols.append("con_code")
-        if has_td:
-            pk_cols.append("trade_date")
-        if pk_cols:
+            pk_cols = [param_name]
+            if "con_code" in names:
+                pk_cols.append("con_code")
+            if has_td:
+                pk_cols.append("trade_date")
             return "(" + ", ".join(pk_cols) + ")"
 
     if has_ts and has_td:

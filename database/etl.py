@@ -15,7 +15,7 @@ REGISTRY = [
     {"api": "index_classify", "table": "index_classify", "default_params": {"src": "SW2021"}},
     {"api": "sz_daily_info", "table": "sz_daily_info", "date_col": "trade_date"},
     {"api": "index_dailybasic", "table": "index_dailybasic", "date_col": "trade_date"},
-    {"api": "index_weight", "table": "index_weight", "date_col": "trade_date", "driver": {"values": ["000300.SH", "000905.SH", "000852.SH", "000985.SH", "399006.SZ", "000906.SH", "399303.SZ"], "date_mode": "monthly"}},
+    {"api": "index_weight", "table": "index_weight", "date_col": "trade_date", "driver": {"values": ["000016.SH", "000300.SH", "000852.SH", "000903.SH", "000905.SH", "000906.SH", "399001.SZ", "399006.SZ", "399303.SZ", "399330.SZ", "399673.SZ", "000985.CSI"], "date_mode": "monthly"}},
     {"api": "ci_index_member", "table": "ci_index_member"},
     {"api": "idx_factor_pro", "table": "idx_factor_pro", "date_col": "trade_date"},
     {"api": "index_member_all", "table": "index_member_all"},
