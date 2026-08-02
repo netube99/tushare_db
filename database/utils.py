@@ -101,8 +101,15 @@ def load_config(config_path: str | None = None) -> dict:
         )
 
 
-def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame) -> int:
-    """将 DataFrame 写入 SQLite 表，主键冲突时 REPLACE."""
+def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
+              drop_null_pk: bool = True, replace_all: bool = True) -> int:
+    """将 DataFrame 写入 SQLite 表，主键冲突时 REPLACE.
+
+    drop_null_pk: 丢弃主键列为 NULL 的行。默认 True（NULL pk 不触发 REPLACE
+    会堆积重复行）；个别表（如 dividend，ann_date 可为空）置 False 保留。
+    replace_all: 无主键表默认整表替换（once 快照表适用）；分区替换场景
+    （partition_key，如 pledge_detail）置 False，仅 INSERT 不删除。
+    """
     if df.empty:
         return 0
     df = df.dropna(how="all")
@@ -120,7 +127,7 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame) -> int:
 
     # 丢弃主键列为 NaN 的脏行（NULL pk 不触发 REPLACE，会堆积重复行）
     nan_pk_cols = list(pk_cols & set(df.columns))
-    if nan_pk_cols:
+    if drop_null_pk and nan_pk_cols:
         df = df.dropna(subset=nan_pk_cols)
         if df.empty:
             return 0
@@ -133,7 +140,7 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame) -> int:
     rows = [tuple(row) for row in df.itertuples(index=False)]
     try:
         # 无 pk 表：整表替换（仅剩 once 策略快照表适用）；与 INSERT 同事务，失败整体回滚
-        if not pk_cols:
+        if not pk_cols and replace_all:
             conn.execute(f'DELETE FROM "{table}"')
         conn.executemany(sql, rows)
         conn.commit()

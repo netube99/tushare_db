@@ -584,8 +584,7 @@ CREATE TABLE IF NOT EXISTS "stk_holdernumber" (
     ts_code TEXT,
     ann_date TEXT,
     end_date TEXT,
-    holder_num INTEGER,
-    PRIMARY KEY (ts_code, ann_date)
+    holder_num INTEGER
 );
 
 -- 股东增减持
@@ -602,27 +601,7 @@ CREATE TABLE IF NOT EXISTS "stk_holdertrade" (
     avg_price REAL,
     total_share REAL,
     begin_date TEXT,
-    close_date TEXT,
-    PRIMARY KEY (ts_code, ann_date)
-);
-
--- 股权质押明细数据
-CREATE TABLE IF NOT EXISTS "pledge_detail" (
-    ts_code TEXT,
-    ann_date TEXT,
-    holder_name TEXT,
-    pledge_amount REAL,
-    start_date TEXT,
-    end_date TEXT,
-    is_release TEXT,
-    release_date TEXT,
-    pledgor TEXT,
-    holding_amount REAL,
-    pledged_amount REAL,
-    p_total_ratio REAL,
-    h_total_ratio REAL,
-    is_buyback TEXT,
-    PRIMARY KEY (ts_code, ann_date)
+    close_date TEXT
 );
 
 -- 沪深港通股票列表
@@ -1164,7 +1143,7 @@ CREATE TABLE IF NOT EXISTS "dividend" (
     imp_ann_date TEXT,
     base_date TEXT,
     base_share REAL,
-    PRIMARY KEY (ts_code, ann_date)
+    PRIMARY KEY (ts_code, ann_date, div_proc)
 );
 
 -- 沪深港通资金流向

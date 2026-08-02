@@ -122,7 +122,18 @@ def _pull_and_store(conn, table: str, df, date_val: str,
     """
     if df is not None and not df.empty:
         try:
-            n = upsert_df(conn, table, df)
+            entry = next((e for e in REGISTRY if e.get("table") == table), None)
+            pkey = entry.get("partition_key") if entry else None
+            if pkey and pkey in df.columns:
+                # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）
+                codes = tuple(str(c) for c in df[pkey].unique())
+                placeholders = ",".join(["?"] * len(codes))
+                conn.execute(
+                    f'DELETE FROM "{table}" WHERE "{pkey}" IN ({placeholders})', codes)
+                conn.commit()
+            n = upsert_df(conn, table, df,
+                          drop_null_pk=not bool(entry and entry.get("null_pk_keep")),
+                          replace_all=not bool(entry and entry.get("partition_key")))
             if log_prefix:
                 logger.info(f"{log_prefix}{table}: {n} rows")
             else:
@@ -1035,6 +1046,15 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
         p = (idx, total)
         table = entry["table"]
         dc_col = entry.get("date_col")
+        strategy = _get_date_params(entry)
+
+        if entry.get("driver") and strategy.get("date_mode") == "once":
+            # once 域表（如 dividend 逐股全量）：MAX(date_col) 无法反映新域值，
+            # 直接全量 dispatch，未拉过的域值由 pull_log done 检查自动补齐
+            logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 逐域刷新")
+            _dispatch_strategy(conn, dc, entry, strategy, None, target_str, progress=p)
+            logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
+            continue
 
         last = conn.execute(f'SELECT MAX("{dc_col}") FROM "{table}"').fetchone()[0]
         if last is None:
@@ -1046,7 +1066,6 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             since = last
 
         logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: {since} → {target_str}")
-        strategy = _get_date_params(entry)
         if strategy["strategy"] == "date_range":
             current_year = target_str[:4]
             conn.execute(
@@ -1080,13 +1099,26 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
         (ok2_cutoff,)
     ).fetchall()
     if ok2_retry:
-        logger.info(f"[daily] 发现 {len(ok2_retry)} 条超期 ok=2 记录，重置重试…")
+        logger.info(f"[daily] 发现 {len(ok2_retry)} 条超期 ok=2 记录，删除并复验…")
+        by_table: dict[str, list[str]] = {}
         for (table, date_val) in ok2_retry:
-            conn.execute(
-                "DELETE FROM pull_log WHERE table_name=? AND date_val=?",
-                (table, date_val),
-            )
+            by_table.setdefault(table, []).append(date_val)
+        conn.execute(
+            "DELETE FROM pull_log WHERE ok=2 AND last_try < ?", (ok2_cutoff,))
         conn.commit()
+        for table, dates in by_table.items():
+            entry = next((e for e in REGISTRY if e["table"] == table), None)
+            if not entry:
+                logger.warning(f"[daily] {table} 不在 REGISTRY，跳过复验")
+                continue
+            strategy = _get_date_params(entry)
+            if strategy["strategy"] != "trade_date":
+                logger.info(
+                    f"[daily] {table}: {len(dates)} 条空日非日频策略，交由全量回补复检")
+                continue
+            s, u = min(dates), max(dates)
+            logger.info(f"[daily] {table}: 复验 {len(dates)} 个超期空日 [{s}..{u}]")
+            _dispatch_strategy(conn, dc, entry, strategy, s, u)
 
     # 自动修复 ok=0 记录
     MAX_RETRY_ATTEMPTS = 5

@@ -141,7 +141,8 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 - **全局 token 级**：`_last_call_global`，确保任意两次请求间最小间隔 `60 / tushare_rate_limit`
 - **per-API 级**：`_last_call[api_name]`，低频 API 更长间隔
 - 间隔计算：`floor = 60 / tushare_rate_limit`，0.8 安全裕度内置于 `recommended_interval_ms`
-- 分页终止条件：返回行数 < `max_rows`
+- 分页终止条件：返回行数 < `max_rows`；offset 超限时 Tushare 部分接口返回业务错误
+  （如 pledge_detail 超 10 万行 50101）→ 保留已拉数据而非整表丢弃
 - `_rate_lock` 包裹限速临界区，线程安全
 
 ### 天级限流冷却（40203）
@@ -178,7 +179,10 @@ python scripts/generate_schema.py
 
 DDL 生成规则：
 - 类型映射：str/None/datetime → TEXT，float → REAL，int → INTEGER
-- 主键推断：`ts_code+trade_date` > `ts_code+ann_date` > `trade_date` > `ts_code` > 无主键
+- 主键推断：`_project.pk_override` 优先 > `ts_code+trade_date` > `ts_code+ann_date` > `trade_date` > `ts_code` > 无主键
+  （dividend 用 pk_override=`(ts_code, ann_date, div_proc)`：Tushare 同一事件多阶段行共享 ann_date）
+- `_project.upsert.null_pk_keep=true` 时保留主键为 NULL 的行（dividend 的 ann_date 可为空，
+  按 ts_code 拉取时这些实施/股东提议行才不丢）
 - SQL 保留字/数字开头/特殊字符自动加双引号
 - 基础设施表（`trade_cal`、`pull_log`）手写 DDL，不被覆盖
 
@@ -202,7 +206,7 @@ main()
        ├─ 3. trade_cal 补拉
        └─ 4. stock_basic / index_basic 刷新
   │
-  ├─ --daily    → 逐表补缺口 → 刷新 once-only 表 → 质检 → 自动修复 ok=0
+  ├─ --daily    → 逐表补缺口 → 刷新 once-only 表 → 质检 → ok=2 超期复验（删除后按表重拉）→ 自动修复 ok=0
   ├─ --refresh  → 单表单日修复
   ├─ --dry-run  → 打印策略矩阵（无副作用）
   │
@@ -219,7 +223,14 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 | `date_range` | 含 `start_date+end_date`，无 trade_date/ann_date | 按年 | `YYYY` | 同上 |
 | `once` | 无日期参数 | 单次 | `__once__` | 同上 |
 | `freq` | freq 必选 | 逐交易日×freq | `YYYYMMDD_W/M` | 同上 |
-| `domain` | entry 含 `driver` 配置 | 逐域值×日期周期 | `域_周期` | 同上 |
+| `domain` | entry 含 `driver` 配置 | 逐域值×日期周期（`date_mode=once` 时逐域单次全量） | `域_周期` / `域__once__` | 同上 |
+
+`_cmd_daily` 对 `date_mode=once` 的域表不做 `MAX(date_col)` 最新性判断，直接全量 dispatch，
+未拉域值（如新股）由 pull_log done 检查自动补齐。dividend 即此模式：`driver.source_table=stk_factor_pro`
+（覆盖退市股）+ `force_required=["dividend.ts_code"]`（注意带 api 前缀）逐股全量拉取，
+才能拿到按 ann_date 逐日拉取永远丢失的多阶段行与 `ann_date=NULL` 行。
+`stk_holdernumber`/`stk_holdertrade`/`pledge_detail` 同款：无主键（`_project.no_pk`）+
+`partition_key=ts_code` 分区替换（DELETE 本域旧行再插入），上游同日多公告/无唯一列时零丢失。
 
 ### pull_after 时间门禁
 
@@ -336,9 +347,10 @@ tests/test_pure.py           — 23 纯函数单测（infer_pk, _quote_name, dat
 tests/test_state_machine.py  — 18 状态机单测（upsert_df, log_pull ok 流转）
 tests/test_integration.py    — 11 mock 集成测试（_fetch_with_retry 各分支）
 tests/test_regression.py     — 4  回归护栏（TABLE_SPECS 键名一致性）
+tests/test_daily_ok2.py      — 3  _cmd_daily ok=2 超期复验 + domain-once 逐域补齐回归
 ```
 
-61 tests，不需要真实数据库或 Tushare 连接。
+64 tests，不需要真实数据库或 Tushare 连接。
 
 ---
 

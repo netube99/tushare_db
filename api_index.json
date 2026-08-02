@@ -11001,7 +11001,9 @@
     "doc_url": "https://tushare.pro/wctapi/documents/166.md",
     "_project": {
       "param_fixes": {
-        "force_required": [],
+        "force_required": [
+          "stk_holdernumber.ts_code"
+        ],
         "force_disabled": []
       },
       "classification": {
@@ -11010,6 +11012,16 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
+      },
+      "date_col": "ann_date",
+      "driver": {
+        "source_table": "stk_factor_pro",
+        "source_column": "ts_code",
+        "date_mode": "once"
+      },
+      "no_pk": true,
+      "upsert": {
+        "partition_key": "ts_code"
       }
     }
   },
@@ -11134,7 +11146,9 @@
     "doc_url": "https://tushare.pro/wctapi/documents/175.md",
     "_project": {
       "param_fixes": {
-        "force_required": [],
+        "force_required": [
+          "stk_holdertrade.ts_code"
+        ],
         "force_disabled": []
       },
       "classification": {
@@ -11143,6 +11157,16 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
+      },
+      "no_pk": true,
+      "upsert": {
+        "partition_key": "ts_code"
+      },
+      "date_col": "ann_date",
+      "driver": {
+        "source_table": "stk_factor_pro",
+        "source_column": "ts_code",
+        "date_mode": "once"
       }
     }
   },
@@ -11360,15 +11384,20 @@
     "doc_url": "https://tushare.pro/wctapi/documents/111.md",
     "_project": {
       "param_fixes": {
-        "force_required": [],
+        "force_required": [
+          "pledge_detail.ts_code"
+        ],
         "force_disabled": []
       },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
+      "no_pk": true,
+      "upsert": {
+        "partition_key": "ts_code"
+      },
+      "date_col": "ann_date",
+      "driver": {
+        "source_table": "stk_factor_pro",
+        "source_column": "ts_code",
+        "date_mode": "once"
       }
     }
   },
@@ -22357,7 +22386,9 @@
     "bulk_note": "需ts_code/ann_date等参数，不能批量拉",
     "_project": {
       "param_fixes": {
-        "force_required": [],
+        "force_required": [
+          "dividend.ts_code"
+        ],
         "force_disabled": []
       },
       "classification": {
@@ -22366,6 +22397,15 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
+      },
+      "pk_override": "(ts_code, ann_date, div_proc)",
+      "driver": {
+        "source_table": "stk_factor_pro",
+        "source_column": "ts_code",
+        "date_mode": "once"
+      },
+      "upsert": {
+        "null_pk_keep": true
       }
     }
   },

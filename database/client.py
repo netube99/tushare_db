@@ -235,7 +235,15 @@ class DataClient:
             page_kwargs = kwargs.copy()
             page_kwargs["limit"] = max_rows
             page_kwargs["offset"] = page * max_rows
-            df = self._request_single(api_name, page_kwargs, force_refresh)
+            try:
+                df = self._request_single(api_name, page_kwargs, force_refresh)
+            except TushareError as e:
+                # 部分接口 offset 超限返回业务错误（如 pledge_detail 超 10 万行）：
+                # 保留已拉数据，避免整表丢弃
+                logger.warning(
+                    f"[{api_name}] offset={page * max_rows} 分页中断: {e}，"
+                    f"保留已拉 {sum(len(d) for d in all_dfs)} 行")
+                break
             if df.empty:
                 break
             if page == 0:

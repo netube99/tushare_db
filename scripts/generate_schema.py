@@ -28,6 +28,14 @@ def sql_type(tushare_type: str | None) -> str:
 
 def infer_pk(api: dict, driver: dict | None = None) -> str | None:
     """从 api 定义推断主键."""
+    proj = api.get("_project") or {}
+    # 源头覆盖：无主键（配合分区替换，如 pledge_detail 同日多笔无唯一列）
+    if proj.get("no_pk"):
+        return None
+    # 源头覆盖：_project.pk_override 优先（如 dividend 多阶段行共享 ann_date）
+    override = proj.get("pk_override")
+    if override:
+        return override
     output_params = api.get("output_params", [])
     names = {p["name"] for p in output_params}
     has_ts = "ts_code" in names
@@ -188,8 +196,16 @@ def generate_registry(api_list: list[dict]) -> str:
         entry = '    {"api": "' + table + '", "table": "' + table + '"'
         if date_col:
             entry += ', "date_col": "' + date_col + '"'
+        elif api.get("_project", {}).get("date_col"):
+            entry += ', "date_col": "' + api["_project"]["date_col"] + '"'
         if driver:
             entry += ', "driver": ' + _json.dumps(driver)
+        upsert_cfg = api.get("_project", {}).get("upsert", {})
+        null_pk_keep = upsert_cfg.get("null_pk_keep")
+        if null_pk_keep:
+            entry += ', "null_pk_keep": True'
+        if upsert_cfg.get("partition_key"):
+            entry += ', "partition_key": "' + upsert_cfg["partition_key"] + '"'
         default_params = api.get("_project", {}).get("default_params")
         if default_params:
             entry += ', "default_params": ' + _json.dumps(default_params)
