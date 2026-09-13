@@ -181,6 +181,14 @@ CREATE TABLE IF NOT EXISTS "cb_basic" (
     PRIMARY KEY (ts_code)
 );
 
+-- 基金规模
+CREATE TABLE IF NOT EXISTS "fund_share" (
+    ts_code TEXT,
+    trade_date TEXT,
+    fd_share REAL,
+    PRIMARY KEY (ts_code, trade_date)
+);
+
 -- 基金技术面因子(专业版)
 CREATE TABLE IF NOT EXISTS "fund_factor_pro" (
     ts_code TEXT,
@@ -602,6 +610,19 @@ CREATE TABLE IF NOT EXISTS "stk_holdertrade" (
     total_share REAL,
     begin_date TEXT,
     close_date TEXT
+);
+
+-- 前十大流通股东
+CREATE TABLE IF NOT EXISTS "top10_floatholders" (
+    ts_code TEXT,
+    ann_date TEXT,
+    end_date TEXT,
+    holder_name TEXT,
+    hold_amount REAL,
+    hold_ratio REAL,
+    hold_float_ratio REAL,
+    hold_change REAL,
+    holder_type TEXT
 );
 
 -- 沪深港通股票列表
