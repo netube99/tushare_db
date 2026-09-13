@@ -106,6 +106,8 @@ class FeatureSync:
         if not rows:
             return 0
 
+        raw_count = len(rows)
+
         if agg:
             rows, col_names = self._apply_aggregation(rows, col_names, table_cfg)
 
@@ -122,7 +124,7 @@ class FeatureSync:
             bin_path = inst_dir / f"{field_name}.day.bin"
             write_bin(bin_path, arrays[j])
 
-        return len(rows)
+        return raw_count
 
     def _query_instrument(self, inst: str, table_cfg: dict,
                           since: str | None = None) -> tuple[list[tuple], list[str]]:
@@ -382,11 +384,36 @@ class FeatureSync:
                         amount_j = k
                     if f2.get("tushare_col") == "vol":
                         vol_j = k
+                if amount_j is None and "amount" in col_names:
+                    amount_j = ("raw", col_names.index("amount"))
+                if vol_j is None and "vol" in col_names:
+                    vol_j = ("raw", col_names.index("vol"))
                 if amount_j is not None and vol_j is not None:
-                    mask = (arrays[vol_j] > 0) & (~np.isnan(arrays[amount_j]))
-                    arrays[j][mask] = arrays[amount_j][mask] * 10.0 / arrays[vol_j][mask]
+                    amount_arr = arrays[amount_j] if isinstance(amount_j, int) \
+                        else self._raw_col_to_calendar(rows, amount_j[1], date_idx, n_cal)
+                    vol_arr = arrays[vol_j] if isinstance(vol_j, int) \
+                        else self._raw_col_to_calendar(rows, vol_j[1], date_idx, n_cal)
+                    mask = (vol_arr > 0) & (~np.isnan(amount_arr))
+                    arrays[j][mask] = amount_arr[mask] * 10.0 / vol_arr[mask]
 
         return arrays
+
+    def _raw_col_to_calendar(self, rows, col_idx, date_idx, n_cal):
+        arr = np.full(n_cal, np.nan, dtype=np.float32)
+        for row in rows:
+            date_val = row[date_idx]
+            if not date_val:
+                continue
+            idx = self.calendar.date_to_index(str(date_val))
+            if idx is None:
+                continue
+            val = row[col_idx]
+            if val is not None:
+                try:
+                    arr[idx] = float(val)
+                except (ValueError, TypeError):
+                    pass
+        return arr
 
     def _cleanup_partial_bins(self, inst: str, field_names: list[str]) -> None:
         """清除中断残留的 bin 文件."""

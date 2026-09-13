@@ -29,10 +29,10 @@ class JsonLogger:
         self._current_date = today
 
     def write(self, data: dict[str, Any]) -> None:
-        ts = beijing_now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-        entry = {"ts": ts, **data}
-        line = json.dumps(entry, ensure_ascii=False) + "\n"
         try:
+            ts = beijing_now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+            entry = {"ts": ts, **data}
+            line = json.dumps(entry, ensure_ascii=False, default=str) + "\n"
             with self._lock:
                 today = beijing_now().strftime("%Y%m%d")
                 self._rotate(today)
@@ -40,15 +40,22 @@ class JsonLogger:
                 self._file.flush()
         except Exception:
             import sys
-            print(line, end="", file=sys.stderr, flush=True)
+            try:
+                print(json.dumps(data, ensure_ascii=False, default=str),
+                      file=sys.stderr, flush=True)
+            except Exception:
+                print(data, file=sys.stderr, flush=True)
 
 
 # 模块级单例，首次调用时初始化
 _logger: JsonLogger | None = None
+_logger_lock = threading.Lock()
 
 
 def get_json_logger() -> JsonLogger:
     global _logger
     if _logger is None:
-        _logger = JsonLogger()
+        with _logger_lock:
+            if _logger is None:
+                _logger = JsonLogger()
     return _logger

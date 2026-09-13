@@ -87,6 +87,13 @@ _SFP_VALUATION = {"pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm",
                   "turnover_rate", "turnover_rate_f", "volume_ratio"}
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 def build_field_map(conn: sqlite3.Connection) -> list[dict]:
     """从 TABLE_SPECS + 实际 DB 结构动态生成 CONVERSION_TABLES.
 
@@ -96,6 +103,8 @@ def build_field_map(conn: sqlite3.Connection) -> list[dict]:
 
     for spec in TABLE_SPECS:
         tbl = spec["table"]
+        if not _table_exists(conn, tbl):
+            continue
         inst_col = spec["inst_col"]
         date_col = spec["date_col"]
         inst_type = spec["type"]

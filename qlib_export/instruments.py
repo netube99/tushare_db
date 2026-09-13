@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 from qlib_export.calendar import format_date as _format_date_raw
-from qlib_export.specs import INSTRUMENT_SOURCES, VIRTUAL_INSTRUMENTS
+from qlib_export.specs import INSTRUMENT_SOURCES, VIRTUAL_INSTRUMENTS, _table_exists
 
 
 def format_date(raw: str) -> str:
@@ -76,6 +76,8 @@ class InstrumentSync:
             if src is None:
                 continue
             table = src["table"]
+            if not _table_exists(conn, table):
+                continue
             code_col = src["code_col"]
             list_col = src["list_col"]
             delist_col = src["delist_col"]
@@ -106,6 +108,8 @@ class InstrumentSync:
                 entries.append((inst, start, end))
 
         for inst, (table, date_col) in VIRTUAL_INSTRUMENTS.items():
+            if not _table_exists(conn, table):
+                continue
             row = conn.execute(
                 f'SELECT MIN("{date_col}"), MAX("{date_col}") FROM "{table}"'
             ).fetchone()
@@ -246,6 +250,8 @@ def get_instruments_for_table(conn: sqlite3.Connection, table_cfg: dict) -> list
         return []
 
     table = src["table"]
+    if not _table_exists(conn, table):
+        return []
     code_col = src["code_col"]
 
     rows = conn.execute(

@@ -4,7 +4,8 @@ import os
 _SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 
-def _load_schema() -> str:
+def load_schema_sql() -> str:
+    """每次调用时读取磁盘上的 schema.sql，保证子进程重生成后能读到新 DDL."""
     try:
         with open(_SCHEMA_PATH) as f:
             return f.read()
@@ -12,4 +13,4 @@ def _load_schema() -> str:
         return ""
 
 
-SCHEMA_SQL = _load_schema()
+SCHEMA_SQL = load_schema_sql()

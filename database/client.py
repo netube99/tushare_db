@@ -88,7 +88,8 @@ class DataClient:
             self._daily_cooldown_until = {
                 k: v for k, v in data.items() if v > now
             }
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (FileNotFoundError, json.JSONDecodeError, OSError,
+                AttributeError, TypeError):
             self._daily_cooldown_until = {}
 
     def _save_cooldown(self) -> None:
@@ -119,7 +120,7 @@ class DataClient:
             if not clf or not clf.get("usable"):
                 continue
 
-            rule = clf["rule"]
+            rule = clf.get("rule")
             if rule not in (1, 2):
                 continue
 
@@ -135,7 +136,7 @@ class DataClient:
             # split_by 自动检测（input_params 在顶层不变）
             split_by = None
             if rule == 1 and max_rows is not None:
-                param_names = [p["name"] for p in api.get("input_params", [])]
+                param_names = [p.get("name") for p in api.get("input_params", [])]
                 if "exchange" in param_names:
                     split_by = "exchange"
                 else:
@@ -189,7 +190,7 @@ class DataClient:
                 )
 
             cfg = self._rule_config.get(api_name, {})
-            interval = cfg.get("interval", 0.5)
+            interval = cfg.get("interval", self._global_interval)
             max_retries = cfg.get("max_retries", 3)
             # 全局 token 级节流（Tushare 限流按 token，非按 API）
             g_elapsed = time.time() - self._last_call_global
@@ -237,9 +238,14 @@ class DataClient:
             page_kwargs["offset"] = page * max_rows
             try:
                 df = self._request_single(api_name, page_kwargs, force_refresh)
+            except DailyLimitError:
+                raise
             except TushareError as e:
                 # 部分接口 offset 超限返回业务错误（如 pledge_detail 超 10 万行）：
-                # 保留已拉数据，避免整表丢弃
+                # 已拉到数据则保留，避免整表丢弃；一页未拉到则向上抛，
+                # 由调用方记 ok=0 重试，不与正常空返回混淆
+                if not all_dfs:
+                    raise
                 logger.warning(
                     f"[{api_name}] offset={page * max_rows} 分页中断: {e}，"
                     f"保留已拉 {sum(len(d) for d in all_dfs)} 行")
@@ -371,8 +377,9 @@ class DataClient:
                 error_msg = result.get("msg", "")
                 if error_code == 40203:
                     cooldown_sec = 24 * 3600
-                    self._daily_cooldown_until[api_name] = time.time() + cooldown_sec
-                    self._save_cooldown()
+                    with self._rate_lock:
+                        self._daily_cooldown_until[api_name] = time.time() + cooldown_sec
+                        self._save_cooldown()
                     logger.warning(
                         f"[{api_name}] 触发天级限流 (40203)，冷却 24h "
                         f"至 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + cooldown_sec))}"

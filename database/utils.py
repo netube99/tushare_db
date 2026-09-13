@@ -6,10 +6,11 @@ import sqlite3
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import yaml
 
-from database.schema import SCHEMA_SQL
+from database.schema import load_schema_sql
 
 # 项目根目录，所有默认路径相对此处解析
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,12 +28,19 @@ def beijing_now() -> datetime:
 
 
 def atomic_write_text(path, text: str) -> None:
-    """原子写文本文件：tmp 文件 + os.replace，防 SIGKILL 截断."""
+    """原子写文本文件：tmp 文件 + os.replace，防 SIGKILL 截断；失败时清理 tmp."""
     path = str(path)
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def beijing_today() -> date:
@@ -41,12 +49,13 @@ def beijing_today() -> date:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """初始化数据库表结构（幂等，CREATE IF NOT EXISTS）."""
-    if not SCHEMA_SQL.strip():
+    """初始化数据库表结构（幂等，CREATE IF NOT EXISTS，每次调用读取最新 schema.sql）."""
+    schema_sql = load_schema_sql()
+    if not schema_sql.strip():
         raise RuntimeError(
             "database/schema.sql 缺失或为空，请先运行 scripts/generate_schema.py 生成"
         )
-    conn.executescript(SCHEMA_SQL)
+    conn.executescript(schema_sql)
     # 迁移：为已有 pull_log 表添加新列
     for col, col_def in [
         ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -67,7 +76,7 @@ def get_conn(db_path: str | None = None) -> sqlite3.Connection:
     上并发执行。
 
     Args:
-        db_path: 数据库文件路径。None 或 ":memory:" 则使用项目默认路径。
+        db_path: 数据库文件路径。None 则使用项目默认路径，":memory:" 为内存库。
     """
     if db_path is None:
         db_path = os.path.join(PROJECT_ROOT, "data", "market.db")
@@ -99,6 +108,8 @@ def load_config(config_path: str | None = None) -> dict:
             f"配置文件不存在: {config_path}\n"
             f"请复制 user_config.template.yaml 为 user_config.yaml 并填写配置"
         )
+    except yaml.YAMLError as e:
+        raise yaml.YAMLError(f"配置文件 YAML 解析错误: {config_path}\n{e}") from e
 
 
 def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
@@ -117,13 +128,20 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
         return 0
 
     # 只保留表中存在的列（过滤 Tushare 未文档化的字段）
-    table_info = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    table_info = conn.execute(f'PRAGMA table_info({_quote_ident(table)})').fetchall()
     table_cols = {row[1] for row in table_info}
     pk_cols = {row[1] for row in table_info if row[5]}  # row[5] = pk flag
     valid_cols = [c for c in df.columns if c in table_cols]
+    if not valid_cols:
+        raise ValueError(
+            f"upsert_df: 表 {table} 不存在，或 DataFrame 列 {list(df.columns)} 与表列完全不匹配"
+        )
     df = df[valid_cols]
-    if df.empty:
-        return 0
+
+    # 主键列必须全部出现，否则 REPLACE 失效，行会以 NULL pk 无限堆积
+    missing_pk = pk_cols - set(df.columns)
+    if pk_cols and missing_pk:
+        raise ValueError(f"upsert_df: 表 {table} 主键列 {sorted(missing_pk)} 不在 DataFrame 中")
 
     # 丢弃主键列为 NaN 的脏行（NULL pk 不触发 REPLACE，会堆积重复行）
     nan_pk_cols = list(pk_cols & set(df.columns))
@@ -134,20 +152,53 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
 
     columns = df.columns.tolist()
     placeholders = ", ".join(["?"] * len(columns))
-    cols_quoted = ", ".join(f'"{c}"' for c in columns)
-    sql = f'INSERT OR REPLACE INTO "{table}" ({cols_quoted}) VALUES ({placeholders})'
+    cols_quoted = ", ".join(_quote_ident(c) for c in columns)
+    sql = f'INSERT OR REPLACE INTO {_quote_ident(table)} ({cols_quoted}) VALUES ({placeholders})'
 
-    rows = [tuple(row) for row in df.itertuples(index=False)]
+    # numpy 数值/布尔 dtype 经 itertuples 产出原生 Python 标量，可直绑；
+    # pandas 3 str dtype 同理（产出 str/nan）；其余（object/datetime64/nullable
+    # extension dtypes 等）逐值归一化，避免 np.int64/Timestamp/NaT/pd.NA 绑定失败
+    if all(isinstance(dt, np.dtype) and dt.kind in "ifbu"
+           or isinstance(dt, pd.StringDtype) for dt in df.dtypes):
+        rows = [tuple(row) for row in df.itertuples(index=False)]
+    else:
+        rows = [
+            tuple(_bind_value(v) for v in row)
+            for row in df.itertuples(index=False)
+        ]
     try:
         # 无 pk 表：整表替换（仅剩 once 策略快照表适用）；与 INSERT 同事务，失败整体回滚
         if not pk_cols and replace_all:
-            conn.execute(f'DELETE FROM "{table}"')
+            conn.execute(f'DELETE FROM {_quote_ident(table)}')
         conn.executemany(sql, rows)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     return len(rows)
+
+
+def _quote_ident(name: str) -> str:
+    """SQLite 标识符引用：双引号包裹，内嵌双引号转义为两个双引号."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _bind_value(v):
+    """将 pandas/numpy 标量归一化为 sqlite3 可绑定类型.
+
+    np 标量 -> Python 标量；NaT/pd.NA -> None；Timestamp/datetime/date -> str
+    （等价于 SQLite TEXT affinity 与已废弃的 datetime adapter 行为，无告警）。
+    其余原样返回。
+    """
+    if v is None or isinstance(v, (bool, int, float, str, bytes)):
+        return v
+    if v is pd.NaT or v is pd.NA:
+        return None
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return str(v)
+    if isinstance(v, np.generic):
+        return _bind_value(v.item())
+    return v
 
 
 def load_api_registry() -> list[dict]:

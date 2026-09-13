@@ -113,7 +113,7 @@ class IncrementalSync:
                         print(f"  [backfill] {inst} ← {source_table}: "
                               f"first_date {first_date} → {current_first}")
 
-                if not needs_reconvert and not table_cfg.get("agg"):
+                if not needs_reconvert:
                     if virtual_inst:
                         if inst_filter:
                             hist_count = self.conn.execute(

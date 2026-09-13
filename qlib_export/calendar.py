@@ -8,6 +8,8 @@ from pathlib import Path
 def format_date(raw: str) -> str:
     """YYYYMMDD → YYYY-MM-DD（取前 8 位；不足 8 位原样返回）."""
     if len(raw) >= 8:
+        if raw[4] == "-" and raw[7] == "-":
+            return raw
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
     return raw
 

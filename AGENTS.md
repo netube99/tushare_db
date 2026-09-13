@@ -238,6 +238,15 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 - 收盘后 → `until = 今天`
 - 收盘前 → `until = 昨天`
 
+### 派生表刷新脚本
+
+独立于 maintain.py 运行、不写 pull_log（`--verify` 覆盖率不追踪派生表）：
+
+- `scripts/refresh_national_team_daily.py` — 由 top10_floatholders 构建国家队在榜/退出事件表
+- `scripts/refresh_pension_daily.py` — 同款构建养老金组合表
+
+两者均依赖 `top10_floatholders` 表，`exclude_apis` 不得排除该接口；派生表刷新需在 `top10_floatholders` 增量更新后手动重跑。
+
 ### 质检报告
 
 | 调用场景 | integrity_check | 行为 |
@@ -263,7 +272,7 @@ market.db (SQLite)
   ├─ IndexConstituentSync    → instruments/{csi300,...}.txt
   ├─ FeatureSync             → features/<inst>/*.day.bin（全量 + 中断续转）
   ├─ IncrementalSync         → 增量追加新交易日
-  ├─ FieldRebuilder          → 按字段维度增删重建
+  ├─ FieldRebuilder          → 按字段维度重建
   └─ build_features_manifest → features_manifest.json
 ```
 
@@ -329,7 +338,7 @@ CREATE TABLE pull_log (
 | `run_start` | main() | run_id, command, since/until |
 | `run_end` | main() | elapsed_sec, total_pulls |
 | `infra` | _run_infrastructure | classify/generate/stock_basic 步骤状态 |
-| `pull` | DataClient + 策略函数 | api, rows, elapsed_ms, cache_hit, ok |
+| `pull` | DataClient + 策略函数 | api, rows, elapsed_ms, cache_hit；ok 仅策略函数/pull_log 侧事件携带 |
 | `error` | DataClient | error_type, error_code, error_msg |
 | `summary` | _verify | tables, total_rows, perfect/gap/empty |
 
@@ -343,14 +352,20 @@ grep '"event":"pull"' logs/maintain_YYYYMMDD.log | jq -r '.ok' | sort | uniq -c
 ## 测试
 
 ```
-tests/test_pure.py           — 23 纯函数单测（infer_pk, _quote_name, date_to_cal_index, _make_key）
-tests/test_state_machine.py  — 18 状态机单测（upsert_df, log_pull ok 流转）
-tests/test_integration.py    — 11 mock 集成测试（_fetch_with_retry 各分支）
-tests/test_regression.py     — 4  回归护栏（TABLE_SPECS 键名一致性）
-tests/test_daily_ok2.py      — 3  _cmd_daily ok=2 超期复验 + domain-once 逐域补齐回归
+tests/test_pure.py            — 纯函数单测（infer_pk, _quote_name, date_to_cal_index, _make_key）
+tests/test_state_machine.py   — 状态机单测（upsert_df, log_pull ok 流转）
+tests/test_integration.py     — mock 集成测试（_fetch_with_retry 各分支）
+tests/test_regression.py      — 回归护栏（TABLE_SPECS 键名一致性）
+tests/test_daily_ok2.py       — _cmd_daily ok=2 超期复验 + domain-once 逐域补齐回归
+tests/test_client_review.py   — DataClient 审查回归（翻页错误传播、冷却、缓存、节流、守护）
+tests/test_db_review.py       — 存储层审查回归（upsert_df 边界、schema 加载、原子写、日志器）
+tests/test_maintain_review.py — maintain 审查回归（策略矩阵、分区替换原子性、refresh/infra 边界）
+tests/test_qlib_review.py     — qlib_export 审查回归（bin 格式、增量检测、中断续转、字段重建）
+tests/test_schema_gen_review.py — schema 生成链审查回归（分级、主键推断、保留字、REGISTRY 注入）
+tests/test_config_review.py   — 配置与辅助脚本审查回归（模板键一致性、派生表原子替换）
 ```
 
-64 tests，不需要真实数据库或 Tushare 连接。
+261 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
 
 ---
 

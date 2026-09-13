@@ -20,7 +20,7 @@ from datetime import date, timedelta
 from database import get_conn, load_config, DataClient
 from database.etl import REGISTRY, log_pull
 import database.etl as _etl_module
-from database.utils import upsert_df, beijing_now, beijing_today
+from database.utils import init_schema, upsert_df, beijing_now, beijing_today
 from database.client import TushareError, DailyLimitError
 
 logger = logging.getLogger("maintain")
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 INFRA_ONCE = ["stock_basic", "index_basic"]
 
 # 基础设施表：非 REGISTRY 系统表 + 常驻表，cleanup 时保留
-INFRA_TABLES = {"trade_cal", "pull_log", "stock_basic"}
+INFRA_TABLES = {"trade_cal", "pull_log", "stock_basic", "bin_sync_log"}
 
 DEFAULT_BACKFILL_SINCE = "20200101"
 DEFAULT_FREQ_VALUES = ["W", "M"]
@@ -95,6 +95,7 @@ def _get_date_params(entry: dict) -> dict:
             if driver:
                 return {"strategy": "domain",
                         "date_col": entry.get("date_col"),
+                        "date_mode": driver.get("date_mode"),
                         "driver": driver}
 
             if any(p["name"] == "freq" and is_required(p["name"])
@@ -125,12 +126,12 @@ def _pull_and_store(conn, table: str, df, date_val: str,
             entry = next((e for e in REGISTRY if e.get("table") == table), None)
             pkey = entry.get("partition_key") if entry else None
             if pkey and pkey in df.columns:
-                # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）
+                # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）；
+                # 不单独 commit，与 INSERT 同事务，失败整体回滚
                 codes = tuple(str(c) for c in df[pkey].unique())
                 placeholders = ",".join(["?"] * len(codes))
                 conn.execute(
                     f'DELETE FROM "{table}" WHERE "{pkey}" IN ({placeholders})', codes)
-                conn.commit()
             n = upsert_df(conn, table, df,
                           drop_null_pk=not bool(entry and entry.get("null_pk_keep")),
                           replace_all=not bool(entry and entry.get("partition_key")))
@@ -141,6 +142,7 @@ def _pull_and_store(conn, table: str, df, date_val: str,
             log_pull(conn, table, date_val, 1, api=api_name, rows=n, strategy=strategy)
             return True
         except Exception as e:
+            conn.rollback()
             logger.error(f"[maintain] {api_name} 写入异常: {e}")
             log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
             return False
@@ -191,7 +193,8 @@ def _auto_fix_bounds(strategy: dict, date_val: str) -> tuple[str | None, str | N
     if strat_name == "trade_date":
         return date_val, date_val, None
     elif strat_name == "date_range":
-        return f"{date_val}0101", f"{date_val}1231", None
+        year = date_val[:4]
+        return f"{year}0101", f"{year}1231", None
     elif strat_name == "freq":
         td, _, _ = date_val.partition("_")
         return td, td, None
@@ -461,6 +464,8 @@ def _apply_param_fixes(api: dict) -> dict:
 
     active = set()
     for p in api.get("input_params", []):
+        if p.get("_disabled"):
+            continue
         full_name = key_prefix + p["name"]
         if full_name in force_disabled:
             continue
@@ -472,6 +477,8 @@ def _apply_param_fixes(api: dict) -> dict:
             return True
         for p in api.get("input_params", []):
             if p["name"] == param_name:
+                if p.get("_disabled"):
+                    return False
                 return p.get("required", False)
         return False
 
@@ -702,6 +709,9 @@ def _run_infrastructure(config, conn, dc):
     global REGISTRY
     REGISTRY = _etl_module.REGISTRY
 
+    # schema.sql 已被重生成，当轮重新初始化表结构（幂等，新表立即可用）
+    init_schema(conn)
+
     # 3. 日历补拉
     cal_count = conn.execute("SELECT COUNT(*) FROM trade_cal").fetchone()[0]
     if cal_count == 0:
@@ -715,7 +725,15 @@ def _run_infrastructure(config, conn, dc):
         ).fetchone()[0]
         if max_cal:
             max_dt = date(int(max_cal[:4]), int(max_cal[4:6]), int(max_cal[6:]))
-            if (max_dt - beijing_today()).days <= 7:
+            today = beijing_today()
+            if max_dt < today:
+                start = (max_dt + timedelta(days=1)).strftime("%Y%m%d")
+                logger.info(f"[infra] 日历落后于当前日期，补拉 {start} → {today}")
+                df = dc.trade_cal(start_date=start,
+                                  end_date=today.strftime("%Y%m%d"))
+                if not df.empty:
+                    upsert_df(conn, "trade_cal", df)
+            elif (max_dt - today).days <= 7:
                 next_year = max_dt.year + 1
                 logger.info(f"[infra] 日历快到底，补拉 {next_year}")
                 df = dc.trade_cal(
@@ -1093,7 +1111,8 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
 
     # ok=2 超期重试
     OK2_RETRY_DAYS = 7
-    ok2_cutoff = (beijing_now() - timedelta(days=OK2_RETRY_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    ok2_cutoff = (beijing_now() - timedelta(days=OK2_RETRY_DAYS)).strftime(
+        "%Y-%m-%d %H:%M:%S")
     ok2_retry = conn.execute(
         "SELECT table_name, date_val FROM pull_log WHERE ok=2 AND last_try < ?",
         (ok2_cutoff,)
@@ -1166,15 +1185,19 @@ def _cmd_refresh(conn, dc, args, run_id, t_start):
     table = entry["table"]
     strategy = _get_date_params(entry)
     if strategy["strategy"] == "date_range":
-        log_key = date_val[:4]
+        log_keys = [date_val[:4]]
     elif strategy["strategy"] == "once":
-        log_key = "__once__"
+        log_keys = ["__once__"]
+    elif strategy["strategy"] == "freq":
+        log_keys = [f"{date_val}_{fv}"
+                    for fv in strategy.get("freq_values", DEFAULT_FREQ_VALUES)]
     else:
-        log_key = date_val
-    conn.execute(
-        "DELETE FROM pull_log WHERE table_name=? AND date_val=?", (table, log_key))
+        log_keys = [date_val]
+    for log_key in log_keys:
+        conn.execute(
+            "DELETE FROM pull_log WHERE table_name=? AND date_val=?", (table, log_key))
     conn.commit()
-    logger.info(f"[refresh] {api} {date_val}: pull_log 已清 (key={log_key})")
+    logger.info(f"[refresh] {api} {date_val}: pull_log 已清 (keys={log_keys})")
     s, u, fdv = _auto_fix_bounds(strategy, date_val)
     _dispatch_strategy(conn, dc, entry, strategy, s, u, filter_date_val=fdv)
     logger.info(f"[refresh] {api} {date_val}: 完成")

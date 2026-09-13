@@ -63,6 +63,8 @@ def infer_pk(api: dict, driver: dict | None = None) -> str | None:
                 pk_cols.append("con_code")
             if has_td:
                 pk_cols.append("trade_date")
+            elif "ann_date" in names:
+                pk_cols.append("ann_date")
             return "(" + ", ".join(pk_cols) + ")"
 
     if has_ts and has_td:
@@ -87,25 +89,35 @@ def infer_pk(api: dict, driver: dict | None = None) -> str | None:
 
 
 _SQL_KEYWORDS = {
-    "on", "limit", "order", "group", "select", "from", "where", "and", "or",
-    "not", "null", "true", "false", "index", "table", "view", "trigger",
-    "primary", "key", "foreign", "references", "check", "default", "unique",
-    "alter", "add", "drop", "create", "insert", "update", "delete", "set",
-    "into", "values", "between", "like", "in", "is", "exists", "having",
-    "asc", "desc", "offset", "union", "except", "intersect", "all", "any",
-    "case", "when", "then", "else", "end", "as", "cast", "distinct",
-    "join", "left", "right", "inner", "outer", "cross", "using",
-    "commit", "rollback", "begin", "transaction", "abort", "replace",
-    "recursive", "without", "rowid", "vacuum", "pragma",
+    "abort", "action", "add", "after", "all", "alter", "always", "analyze",
+    "and", "as", "asc", "attach", "autoincrement", "before", "begin",
+    "between", "by", "cascade", "case", "cast", "check", "collate",
+    "column", "commit", "conflict", "constraint", "create", "cross",
+    "current", "current_date", "current_time", "current_timestamp",
+    "database", "default", "deferrable", "deferred", "delete", "desc",
+    "detach", "distinct", "do", "drop", "each", "else", "end", "escape",
+    "except", "exclusive", "exists", "explain", "fail", "for", "foreign",
+    "from", "full", "glob", "group", "having", "if", "ignore", "immediate",
+    "in", "index", "indexed", "initially", "inner", "insert", "instead",
+    "intersect", "into", "is", "isnull", "join", "key", "left", "like",
+    "limit", "match", "natural", "no", "not", "nothing", "notnull", "null",
+    "of", "offset", "on", "or", "order", "outer", "plan", "pragma",
+    "primary", "query", "raise", "recursive", "references", "regexp",
+    "reindex", "release", "rename", "replace", "restrict", "returning",
+    "right", "rollback", "row", "rows", "savepoint", "select", "set",
+    "table", "temp", "temporary", "then", "ties", "to", "transaction",
+    "trigger", "unbounded", "union", "unique", "update", "using", "vacuum",
+    "values", "view", "virtual", "when", "where", "window", "with",
+    "without", "true", "false", "rowid",
 }
 
 
 def _quote_name(name: str) -> str:
     """如果列名需要引号则加双引号（SQL保留字/数字开头/含特殊字符）."""
     if name.lower() in _SQL_KEYWORDS:
-        return f'"{name}"'
+        return '"' + name.replace('"', '""') + '"'
     if name[0].isdigit() or not name.replace("_", "").isalnum():
-        return f'"{name}"'
+        return '"' + name.replace('"', '""') + '"'
     return name
 
 
@@ -226,6 +238,11 @@ def inject_registry(etl_path: str, registry_code: str) -> None:
     with open(etl_path) as f:
         content = f.read()
 
+    try:
+        compile(registry_code, "<registry>", "exec")
+    except SyntaxError as e:
+        raise ValueError(f"registry_code 语法非法: {e}")
+
     start = content.find("REGISTRY = [")
     if start == -1:
         raise ValueError("etl.py 中未找到 REGISTRY = [")
@@ -246,6 +263,10 @@ def inject_registry(etl_path: str, registry_code: str) -> None:
         raise ValueError("找不到 REGISTRY 块结束位置")
 
     new_content = content[:comment_line] + registry_code + "\n" + content[end + 1:]
+    try:
+        compile(new_content, etl_path, "exec")
+    except SyntaxError as e:
+        raise ValueError(f"注入后 etl.py 语法非法: {e}")
     tmp_path = etl_path + ".tmp"
     with open(tmp_path, "w") as f:
         f.write(new_content)
