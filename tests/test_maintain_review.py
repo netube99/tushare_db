@@ -441,7 +441,7 @@ def test_verify_flags_over_100_day_gap(monkeypatch):
     monkeypatch.setattr(m, "REGISTRY", [entry])
     monkeypatch.setattr(m, "load_config", lambda: {})
 
-    result = m._verify(conn, report_issues=False)
+    result = m._verify(conn)
 
     assert result["big_gap"] == 1
     assert any("可能Tushare断供" in s for s in result["design_issues"])
@@ -460,7 +460,7 @@ def test_verify_domain_monthly_coverage(monkeypatch):
     monkeypatch.setattr(m, "REGISTRY", [entry])
     monkeypatch.setattr(m, "load_config", lambda: {})
 
-    result = m._verify(conn, report_issues=False)
+    result = m._verify(conn)
 
     assert result["big_gap"] == 1
     assert any(t == "index_weight" and "1域 × 2/3周期" in detail
@@ -547,7 +547,7 @@ def test_verify_integrity_check_flag(monkeypatch, capsys):
                         [{"api": "fake", "table": "t_x", "date_col": "trade_date"}])
     monkeypatch.setattr(m, "load_config", lambda: {})
 
-    result = m._verify(conn, report_issues=False, integrity_check=True)
+    result = m._verify(conn, integrity_check=True)
 
     out = capsys.readouterr().out
     assert result["tables"] == 1
@@ -560,7 +560,7 @@ def test_verify_default_skips_integrity_check(monkeypatch, capsys):
                         [{"api": "fake", "table": "t_x", "date_col": "trade_date"}])
     monkeypatch.setattr(m, "load_config", lambda: {})
 
-    m._verify(conn, report_issues=False)
+    m._verify(conn)
 
     assert "integrity_check" not in capsys.readouterr().out
 

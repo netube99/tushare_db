@@ -245,7 +245,7 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 - `scripts/refresh_national_team_daily.py` — 由 top10_floatholders 构建国家队在榜/退出事件表
 - `scripts/refresh_pension_daily.py` — 同款构建养老金组合表
 
-两者均依赖 `top10_floatholders` 表，`exclude_apis` 不得排除该接口；派生表刷新需在 `top10_floatholders` 增量更新后手动重跑。
+两者共享 `scripts/_derived_tables.py`（缺表预检、stale 交易日携带展开、原子替换）；均依赖 `top10_floatholders` 表，`exclude_apis` 不得排除该接口；派生表刷新需在 `top10_floatholders` 增量更新后手动重跑。
 
 ### 质检报告
 

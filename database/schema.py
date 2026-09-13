@@ -11,6 +11,3 @@ def load_schema_sql() -> str:
             return f.read()
     except FileNotFoundError:
         return ""
-
-
-SCHEMA_SQL = load_schema_sql()

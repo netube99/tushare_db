@@ -87,6 +87,17 @@ _SFP_VALUATION = {"pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm",
                   "turnover_rate", "turnover_rate_f", "volume_ratio"}
 
 
+def _computed_fields(computed_specs: list) -> list[dict]:
+    """computed 声明 (bin_name, kind[, agg_sum_col]) → 字段定义."""
+    fields = []
+    for item in computed_specs:
+        fdef: dict = {"bin_name": item[0], "computed": item[1]}
+        if len(item) > 2:
+            fdef["agg_sum_col"] = item[2]
+        fields.append(fdef)
+    return fields
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -233,12 +244,7 @@ def _derive_stk_factor_fields(numeric_cols: set[str], computed_specs: list) -> l
         bin_name = col.replace("_hfq", "")
         fields.append({"bin_name": bin_name, "tushare_col": col})
 
-    for item in computed_specs:
-        fdef: dict = {"bin_name": item[0], "computed": item[1]}
-        if len(item) > 2:
-            fdef["agg_sum_col"] = item[2]
-        fields.append(fdef)
-
+    fields.extend(_computed_fields(computed_specs))
     return fields
 
 
@@ -260,12 +266,7 @@ def _derive_factor_fields(numeric_cols: set[str], tech_prefix: str,
             base = col
         fields.append({"bin_name": f"{tech_prefix}_{base}", "tushare_col": col})
 
-    for item in computed_specs:
-        fdef: dict = {"bin_name": item[0], "computed": item[1]}
-        if len(item) > 2:
-            fdef["agg_sum_col"] = item[2]
-        fields.append(fdef)
-
+    fields.extend(_computed_fields(computed_specs))
     return fields
 
 
@@ -276,8 +277,7 @@ def _derive_standard_fields(numeric_cols: set[str], prefix: str | None,
     for col in sorted(numeric_cols):
         bin_name = f"{prefix}_{col}" if prefix else col
         fields.append({"bin_name": bin_name, "tushare_col": col})
-    for item in computed_specs:
-        fields.append({"bin_name": item[0], "computed": item[1]})
+    fields.extend(_computed_fields(computed_specs))
     return fields
 
 
@@ -297,20 +297,13 @@ def _derive_agg_fields(numeric_cols: set[str], prefix: str | None,
     count_name = spec.get("agg_count")
     if count_name:
         fields.append({"bin_name": count_name, "computed": "count"})
-    for item in spec.get("computed", []):
-        fdef: dict = {"bin_name": item[0], "computed": item[1]}
-        if len(item) > 2:
-            fdef["agg_sum_col"] = item[2]
-        fields.append(fdef)
+    fields.extend(_computed_fields(spec.get("computed", [])))
     return fields
 
 
 def _derive_encoded_fields(spec: dict) -> list[dict]:
     """编码表: 无原生数值列，从 computed specs 生成."""
-    fields = []
-    for item in spec.get("computed", []):
-        fields.append({"bin_name": item[0], "computed": item[1]})
-    return fields
+    return _computed_fields(spec.get("computed", []))
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import pickle
 import threading
 import time
 from functools import partial
@@ -88,8 +87,7 @@ class DataClient:
             self._daily_cooldown_until = {
                 k: v for k, v in data.items() if v > now
             }
-        except (FileNotFoundError, json.JSONDecodeError, OSError,
-                AttributeError, TypeError):
+        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
             self._daily_cooldown_until = {}
 
     def _save_cooldown(self) -> None:
@@ -128,19 +126,14 @@ class DataClient:
 
             # 间隔：优先用 classification 的计算值，但不低于硬地板
             rec_ms = clf.get("recommended_interval_ms")
-            if rule == 2:
-                interval = floor_r2_sec if rec_ms is None else max(floor_r2_sec, rec_ms / 1000)
-            else:
-                interval = floor_sec if rec_ms is None else max(floor_sec, rec_ms / 1000)
+            floor = floor_r2_sec if rule == 2 else floor_sec
+            interval = floor if rec_ms is None else max(floor, rec_ms / 1000)
 
             # split_by 自动检测（input_params 在顶层不变）
             split_by = None
             if rule == 1 and max_rows is not None:
                 param_names = [p.get("name") for p in api.get("input_params", [])]
-                if "exchange" in param_names:
-                    split_by = "exchange"
-                else:
-                    split_by = "offset"
+                split_by = "exchange" if "exchange" in param_names else "offset"
 
             self._rule_config[api["api_name"]] = {
                 "rule": rule,
@@ -149,6 +142,11 @@ class DataClient:
                 "split_by": split_by,
                 "max_retries": clf.get("max_retries", 3),
             }
+
+    def _throttle(self, last: float, interval: float) -> None:
+        elapsed = time.time() - last
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
 
     def _request_single(
         self, api_name: str, kwargs: dict, force_refresh: bool = False
@@ -168,16 +166,15 @@ class DataClient:
         cache_key = self._make_key(req_params)
         cache_file = api_cache_dir / f"{cache_key}.pkl"
 
-        if not force_refresh and cache_file.exists():
+        if (not force_refresh and cache_file.exists()
+                and (time.time() - cache_file.stat().st_mtime) / 86400 < 7):
             # 缓存 7 天过期，防止 Tushare 修正数据后仍取旧货
-            age_days = (time.time() - cache_file.stat().st_mtime) / 86400
-            if age_days < 7:
-                df = self._read_cache(cache_file)
-                if df is not None:
-                    self._jlog_pull(api_name, len(df),
-                                   round((time.time() - t_start) * 1000, 1),
-                                   cache_hit=True, attempt=1)
-                    return df
+            df = self._read_cache(cache_file)
+            if df is not None:
+                self._jlog_pull(api_name, len(df),
+                               round((time.time() - t_start) * 1000, 1),
+                               cache_hit=True, attempt=1)
+                return df
 
         # 天级限流冷却检查 + HTTP 请求级限速（读-改-写，需锁保护）
         with self._rate_lock:
@@ -193,13 +190,9 @@ class DataClient:
             interval = cfg.get("interval", self._global_interval)
             max_retries = cfg.get("max_retries", 3)
             # 全局 token 级节流（Tushare 限流按 token，非按 API）
-            g_elapsed = time.time() - self._last_call_global
-            if g_elapsed < self._global_interval:
-                time.sleep(self._global_interval - g_elapsed)
+            self._throttle(self._last_call_global, self._global_interval)
             # per-API 间隔（rule 2 等低频 API 需更长间隔）
-            elapsed = time.time() - self._last_call.get(api_name, 0)
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
+            self._throttle(self._last_call.get(api_name, 0), interval)
             now = time.time()
             self._last_call[api_name] = now
             self._last_call_global = now
@@ -212,12 +205,14 @@ class DataClient:
             self._write_cache(cache_file, df)
         return df
 
-    def _jlog_pull(self, api_name: str, rows: int, elapsed_ms: float,
-                  cache_hit: bool = False, attempt: int = 1) -> None:
-        """记录单次拉取到 JSON 日志."""
+    def _jlog(self, entry: dict) -> None:
         from database.logger import get_json_logger
-        jlog = get_json_logger()
-        jlog.write({
+        get_json_logger().write(entry)
+
+    def _jlog_pull(self, api_name: str, rows: int, elapsed_ms: float,
+                   cache_hit: bool = False, attempt: int = 1) -> None:
+        """记录单次拉取到 JSON 日志."""
+        self._jlog({
             "level": "INFO", "module": "client", "event": "pull",
             "api": api_name, "rows": rows, "elapsed_ms": elapsed_ms,
             "cache_hit": cache_hit, "attempt": attempt,
@@ -229,22 +224,16 @@ class DataClient:
     ) -> pd.DataFrame:
         """offset 递增分页拉取全部数据。"""
         all_dfs = []
-        page = 0
-        max_pages = 200
         first_page_fingerprint = None
-        while page < max_pages:
-            page_kwargs = kwargs.copy()
-            page_kwargs["limit"] = max_rows
-            page_kwargs["offset"] = page * max_rows
+        for page in range(200):
+            page_kwargs = {**kwargs, "limit": max_rows, "offset": page * max_rows}
             try:
                 df = self._request_single(api_name, page_kwargs, force_refresh)
-            except DailyLimitError:
-                raise
             except TushareError as e:
-                # 部分接口 offset 超限返回业务错误（如 pledge_detail 超 10 万行）：
-                # 已拉到数据则保留，避免整表丢弃；一页未拉到则向上抛，
-                # 由调用方记 ok=0 重试，不与正常空返回混淆
-                if not all_dfs:
+                # DailyLimitError 始终上抛；其余业务错误（如 pledge_detail 超
+                # 10 万行 50101）在已有数据时保留，避免整表丢弃；
+                # 一页未拉到则向上抛，由调用方记 ok=0 重试，不与正常空返回混淆
+                if not all_dfs or isinstance(e, DailyLimitError):
                     raise
                 logger.warning(
                     f"[{api_name}] offset={page * max_rows} 分页中断: {e}，"
@@ -252,17 +241,15 @@ class DataClient:
                 break
             if df.empty:
                 break
+            fingerprint = str(df.iloc[0].to_dict())
             if page == 0:
-                first_page_fingerprint = str(df.iloc[0].to_dict())
-            elif first_page_fingerprint:
-                cur_fp = str(df.iloc[0].to_dict())
-                if cur_fp == first_page_fingerprint:
-                    logger.warning(f"[{api_name}] offset={page*max_rows} 重复首页数据，终止分页")
-                    break
+                first_page_fingerprint = fingerprint
+            elif fingerprint == first_page_fingerprint:
+                logger.warning(f"[{api_name}] offset={page*max_rows} 重复首页数据，终止分页")
+                break
             all_dfs.append(df)
             if len(df) < max_rows:
                 break
-            page += 1
 
         if not all_dfs:
             return pd.DataFrame()
@@ -273,16 +260,13 @@ class DataClient:
         force_refresh: bool,
     ) -> pd.DataFrame:
         """按交易所 SH/SZ/BJ 分批，每个交易所内部再用 offset 翻页。"""
-        exchanges = ["SH", "SZ", "BJ"]
         all_dfs = []
-        for exg_code in exchanges:
-            ex_kwargs = kwargs.copy()
-            ex_kwargs["exchange"] = exg_code
-            df = self._paginate_offset(
-                api_name, ex_kwargs, max_rows, force_refresh
+        for exg_code in ["SH", "SZ", "BJ"]:
+            ex_df = self._paginate_offset(
+                api_name, {**kwargs, "exchange": exg_code}, max_rows, force_refresh
             )
-            if not df.empty:
-                all_dfs.append(df)
+            if not ex_df.empty:
+                all_dfs.append(ex_df)
         if not all_dfs:
             return pd.DataFrame()
         return pd.concat(all_dfs, ignore_index=True)
@@ -309,13 +293,12 @@ class DataClient:
             return self._paginate_exchange(
                 api_name, kwargs, max_rows, force_refresh
             )
-        elif rule == 1 and split_by == "offset":
+        if rule == 1 and split_by == "offset":
             return self._paginate_offset(
                 api_name, kwargs, max_rows, force_refresh
             )
-        else:
-            # rule 1 (max_rows=None), rule 2, rule 3
-            return self._request_single(api_name, kwargs, force_refresh)
+        # rule 1 (max_rows=None), rule 2, rule 3
+        return self._request_single(api_name, kwargs, force_refresh)
 
     def _make_key(self, req_params: dict) -> str:
         params_no_token = {k: v for k, v in req_params.items() if k != "token"}
@@ -336,40 +319,44 @@ class DataClient:
             except Exception as e:
                 logger.warning(f"写入缓存失败: {file}, {e}")
 
+    def _retry_wait(self, api_name: str, error_type: str, warn: str,
+                    attempt: int, max_retries: int, **log_kw) -> None:
+        """记录一次可重试失败，非末次尝试等待 5s。"""
+        logger.warning(warn)
+        self._log_error(api_name, error_type, **log_kw)
+        if attempt < max_retries - 1:
+            time.sleep(5)
+
     def _fetch_with_retry(self, req_params, api_name, max_retries: int = 3) -> tuple:
         for attempt in range(max_retries):
             try:
                 res = self._session.post(self._url, json=req_params, timeout=self._timeout,
                                          proxies=self._proxies)
             except requests.RequestException as e:
-                logger.warning(f"[{api_name}] 请求异常, 重试 {attempt+1}/{max_retries}: {e}")
-                self._log_error(api_name, "RequestException", error_msg=str(e))
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "RequestException",
+                                 f"[{api_name}] 请求异常, 重试 {attempt+1}/{max_retries}: {e}",
+                                 attempt, max_retries, error_msg=str(e))
                 continue
 
             if res.status_code != 200:
-                logger.warning(f"[{api_name}] HTTP {res.status_code}, 重试 {attempt+1}/{max_retries}")
-                self._log_error(api_name, "HTTPError", http_status=res.status_code,
-                                error_msg=f"HTTP {res.status_code}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "HTTPError",
+                                 f"[{api_name}] HTTP {res.status_code}, 重试 {attempt+1}/{max_retries}",
+                                 attempt, max_retries, http_status=res.status_code,
+                                 error_msg=f"HTTP {res.status_code}")
                 continue
 
             try:
                 result = res.json()
             except Exception as e:
-                logger.warning(f"[{api_name}] JSON 解析失败, 重试 {attempt+1}/{max_retries}: {e}")
-                self._log_error(api_name, "JSONDecodeError", error_msg=str(e))
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "JSONDecodeError",
+                                 f"[{api_name}] JSON 解析失败, 重试 {attempt+1}/{max_retries}: {e}",
+                                 attempt, max_retries, error_msg=str(e))
                 continue
 
             if not isinstance(result, dict) or "code" not in result:
-                logger.warning(f"[{api_name}] 返回结构异常, 重试 {attempt+1}/{max_retries}")
-                self._log_error(api_name, "BadResponse", error_msg=str(result))
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "BadResponse",
+                                 f"[{api_name}] 返回结构异常, 重试 {attempt+1}/{max_retries}",
+                                 attempt, max_retries, error_msg=str(result))
                 continue
 
             if result["code"] != 0:
@@ -393,19 +380,17 @@ class DataClient:
 
             data = result.get("data", {})
             if not isinstance(data, dict) or "items" not in data or "fields" not in data:
-                logger.warning(f"[{api_name}] data 结构异常, 重试 {attempt+1}/{max_retries}")
-                self._log_error(api_name, "BadData", error_msg=str(data))
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "BadData",
+                                 f"[{api_name}] data 结构异常, 重试 {attempt+1}/{max_retries}",
+                                 attempt, max_retries, error_msg=str(data))
                 continue
 
             try:
                 return pd.DataFrame(data["items"], columns=data["fields"]), attempt + 1
             except Exception as e:
-                logger.warning(f"[{api_name}] DataFrame 构建失败, 重试 {attempt+1}/{max_retries}: {e}")
-                self._log_error(api_name, "DataFrameError", error_msg=str(e))
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                self._retry_wait(api_name, "DataFrameError",
+                                 f"[{api_name}] DataFrame 构建失败, 重试 {attempt+1}/{max_retries}: {e}",
+                                 attempt, max_retries, error_msg=str(e))
                 continue
 
         raise TushareError(
@@ -417,8 +402,6 @@ class DataClient:
                    error_code=None, error_msg: str = "",
                    http_status=None) -> None:
         """记录异常到 JSON 日志."""
-        from database.logger import get_json_logger
-        jlog = get_json_logger()
         entry = {
             "level": "ERROR", "module": "client", "event": "error",
             "api": api_name, "error_type": error_type, "error_msg": error_msg,
@@ -427,7 +410,7 @@ class DataClient:
             entry["error_code"] = error_code
         if http_status is not None:
             entry["http_status"] = http_status
-        jlog.write(entry)
+        self._jlog(entry)
 
     def clear_cache(self) -> None:
         import shutil

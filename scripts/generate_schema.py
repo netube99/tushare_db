@@ -16,47 +16,34 @@ from database.utils import atomic_write_text, load_api_registry
 
 def sql_type(tushare_type: str | None) -> str:
     """Tushare 类型 → SQLite 类型."""
-    if tushare_type is None:
-        return "TEXT"
-    t = str(tushare_type).lower()
-    if t in ("float",):
-        return "REAL"
+    t = str(tushare_type).lower() if tushare_type is not None else ""
     if t in ("int", "integer"):
         return "INTEGER"
+    if t == "float":
+        return "REAL"
     return "TEXT"
 
 
 def infer_pk(api: dict, driver: dict | None = None) -> str | None:
     """从 api 定义推断主键."""
     proj = api.get("_project") or {}
-    # 源头覆盖：无主键（配合分区替换，如 pledge_detail 同日多笔无唯一列）
     if proj.get("no_pk"):
         return None
-    # 源头覆盖：_project.pk_override 优先（如 dividend 多阶段行共享 ann_date）
-    override = proj.get("pk_override")
-    if override:
-        return override
-    output_params = api.get("output_params", [])
-    names = {p["name"] for p in output_params}
+    if proj.get("pk_override"):
+        return proj["pk_override"]
+    names = {p["name"] for p in api.get("output_params", [])}
     has_ts = "ts_code" in names
     has_td = "trade_date" in names
-    has_ad = "ann_date" in names
-    has_ic = "index_code" in names
-    has_cc = "con_code" in names
-    has_ei = "exchange_id" in names
-    has_dt = "date" in names
 
     if driver:
-        param_name = None
-        for p in api.get("input_params", []):
-            force_req = api.get("_project", {}).get("param_fixes", {}).get("force_required", [])
-            api_fq = api.get("api_name", "") + "." + p["name"]
-            if (p.get("required") or api_fq in force_req) and p["name"] not in (
-                "trade_date", "start_date", "end_date", "ann_date",
-                "freq", "offset", "limit",
-            ):
-                param_name = p["name"]
-                break
+        force_req = proj.get("param_fixes", {}).get("force_required", [])
+        skip = {"trade_date", "start_date", "end_date", "ann_date",
+                "freq", "offset", "limit"}
+        api_name = api.get("api_name", "")
+        param_name = next((p["name"] for p in api.get("input_params", [])
+                           if (p.get("required")
+                               or api_name + "." + p["name"] in force_req)
+                           and p["name"] not in skip), None)
         if param_name and param_name in names:
             pk_cols = [param_name]
             if "con_code" in names:
@@ -69,21 +56,21 @@ def infer_pk(api: dict, driver: dict | None = None) -> str | None:
 
     if has_ts and has_td:
         return "(ts_code, trade_date)"
-    if has_ic and has_td and not has_ts:
+    if "index_code" in names and has_td and not has_ts:
         return "(index_code, trade_date)"
-    if has_ts and has_ad:
+    if has_ts and "ann_date" in names:
         return "(ts_code, ann_date)"
-    if has_ei and has_td and not has_ts:
+    if "exchange_id" in names and has_td and not has_ts:
         return "(exchange_id, trade_date)"
-    if has_td and not (has_ts or has_ic):
+    if has_td and not (has_ts or "index_code" in names):
         return "(trade_date)"
     if has_ts:
         return "(ts_code)"
-    if has_ic:
+    if "index_code" in names:
         return "(index_code)"
-    if has_cc:
+    if "con_code" in names:
         return "(con_code)"
-    if has_dt:
+    if "date" in names:
         return "(date)"
     return None
 
@@ -123,23 +110,18 @@ def _quote_name(name: str) -> str:
 
 def generate_table_ddl(api: dict, driver: dict | None = None) -> str:
     """为单个 API 生成 CREATE TABLE 语句."""
-    table_name = api["api_name"]
     fields = api.get("output_params", [])
     if not fields:
         return ""
 
     pk = infer_pk(api, driver)
-
-    col_defs = []
-    for p in fields:
-        col = f"    {_quote_name(p['name'])}"
-        col += f" {sql_type(p.get('type'))}"
-        col_defs.append(col)
+    col_defs = [f"    {_quote_name(p['name'])} {sql_type(p.get('type'))}"
+                for p in fields]
     if pk:
         col_defs.append(f"    PRIMARY KEY {pk}")
 
     body = ",\n".join(col_defs)
-    return f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n{body}\n);'
+    return f'CREATE TABLE IF NOT EXISTS "{api["api_name"]}" (\n{body}\n);'
 
 
 # ── 基础设施表 DDL ──
@@ -168,69 +150,65 @@ CREATE TABLE IF NOT EXISTS pull_log (
 # ── I/O ──
 
 def generate_schema(api_list: list[dict]) -> str:
-    parts = [INFRA_DDL.rstrip()]
-    seen = set()
+    blocks = [INFRA_DDL.rstrip()]
+    seen: set[str] = set()
     for api in api_list:
         if api["api_name"] in seen:
             continue
         seen.add(api["api_name"])
-        driver = api.get("_project", {}).get("driver")
-        ddl = generate_table_ddl(api, driver)
+        ddl = generate_table_ddl(api, (api.get("_project") or {}).get("driver"))
         if ddl:
-            parts.append("")
-            parts.append(f"-- {api.get('title', api['api_name'])}")
-            parts.append(ddl)
-    return "\n".join(parts) + "\n"
+            blocks.append(f"-- {api.get('title', api['api_name'])}\n{ddl}")
+    return "\n\n".join(blocks) + "\n"
 
 
 def generate_registry(api_list: list[dict]) -> str:
     """生成 REGISTRY — 仅规则 1/2 且 classification.usable=true 接口."""
-    seen = set()
+    seen: set[str] = set()
     entries = []
     for api in api_list:
-        clf = api.get("_project", {}).get("classification", {})
+        proj = api.get("_project") or {}
+        clf = proj.get("classification", {})
         if clf.get("rule") not in (1, 2) or not clf.get("usable"):
             continue
         table = api["api_name"]
         if table in seen:
             continue
         seen.add(table)
-        fields = api.get("output_params", [])
-        driver = api.get("_project", {}).get("driver")
-        pk = infer_pk(api, driver)
+
+        pk = infer_pk(api, proj.get("driver"))
         pk_set = set(pk.strip("()").split(", ")) if pk else set()
-        date_col = None
         if "trade_date" in pk_set:
             date_col = "trade_date"
         elif "ann_date" in pk_set:
             date_col = "ann_date"
+        elif proj.get("date_col"):
+            date_col = proj["date_col"]
+        else:
+            date_col = None
 
-        entry = '    {"api": "' + table + '", "table": "' + table + '"'
+        upsert = proj.get("upsert", {})
+        frags = [f'    {{"api": "{table}", "table": "{table}"']
         if date_col:
-            entry += ', "date_col": "' + date_col + '"'
-        elif api.get("_project", {}).get("date_col"):
-            entry += ', "date_col": "' + api["_project"]["date_col"] + '"'
-        if driver:
-            entry += ', "driver": ' + _json.dumps(driver)
-        upsert_cfg = api.get("_project", {}).get("upsert", {})
-        null_pk_keep = upsert_cfg.get("null_pk_keep")
-        if null_pk_keep:
-            entry += ', "null_pk_keep": True'
-        if upsert_cfg.get("partition_key"):
-            entry += ', "partition_key": "' + upsert_cfg["partition_key"] + '"'
-        default_params = api.get("_project", {}).get("default_params")
-        if default_params:
-            entry += ', "default_params": ' + _json.dumps(default_params)
-        entry += "},"
-        entries.append(entry)
+            frags.append(f', "date_col": "{date_col}"')
+        if proj.get("driver"):
+            frags.append(f', "driver": {_json.dumps(proj["driver"])}')
+        if upsert.get("null_pk_keep"):
+            frags.append(', "null_pk_keep": True')
+        if upsert.get("partition_key"):
+            frags.append(f', "partition_key": "{upsert["partition_key"]}"')
+        if proj.get("default_params"):
+            frags.append(
+                f', "default_params": {_json.dumps(proj["default_params"])}')
+        frags.append("},")
+        entries.append("".join(frags))
 
-    lines = [
+    return "\n".join([
         "# 自动生成，勿手工编辑。运行 scripts/generate_schema.py 重新生成",
         "REGISTRY = [",
-    ]
-    lines.extend(entries)
-    lines.append("]")
-    return "\n".join(lines) + "\n"
+        *entries,
+        "]",
+    ]) + "\n"
 
 
 def inject_registry(etl_path: str, registry_code: str) -> None:
@@ -275,8 +253,8 @@ def inject_registry(etl_path: str, registry_code: str) -> None:
 
 def main():
     api_list = [api for api in load_api_registry()
-                if api.get("_project", {}).get("classification", {}).get("usable")
-                and api.get("_project", {}).get("classification", {}).get("rule") in (1, 2)]
+                if (clf := (api.get("_project") or {}).get("classification", {})).get("usable")
+                and clf.get("rule") in (1, 2)]
 
     schema_sql = generate_schema(api_list)
     schema_path = PROJECT_ROOT / "database" / "schema.sql"

@@ -421,9 +421,10 @@ def test_init_schema_reads_fresh_from_disk(conn, monkeypatch, tmp_path):
 # ── schema.sql pull_log DDL 与 AGENTS.md 契约一致 ──
 
 def test_schema_sql_pull_log_ddl_matches_contract():
-    from database.schema import SCHEMA_SQL
-    idx = SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS pull_log")
-    snippet = SCHEMA_SQL[idx:SCHEMA_SQL.index(";", idx)]
+    from database.schema import load_schema_sql
+    schema_sql = load_schema_sql()
+    idx = schema_sql.index("CREATE TABLE IF NOT EXISTS pull_log")
+    snippet = schema_sql[idx:schema_sql.index(";", idx)]
     for field in ("table_name", "date_val", "ok", "retry_count", "last_try"):
         assert field in snippet
     assert "PRIMARY KEY (table_name, date_val)" in snippet

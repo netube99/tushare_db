@@ -143,6 +143,16 @@ def write_manifest(output_dir: Path, manifest: dict) -> None:
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _emit_manifest(output_dir: Path, conversion_tables: list[dict],
+                   calendar: CalendarSync, total_instruments: int | None = None) -> dict:
+    """生成并写入 features_manifest.json."""
+    manifest = build_features_manifest(conversion_tables, calendar)
+    if total_instruments is not None:
+        manifest["_meta"]["total_instruments"] = total_instruments
+    write_manifest(output_dir, manifest)
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # CLI 入口
 # ---------------------------------------------------------------------------
@@ -151,14 +161,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="tushare_db → Qlib Bin 数据转换引擎",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python scripts/convert_to_qlib.py                  # 全量转换（中断自动续转）
-  python scripts/convert_to_qlib.py --daily           # 每日增量同步
-  python scripts/convert_to_qlib.py --reset           # 清除所有 bin 及同步状态，从头全量
-  python scripts/convert_to_qlib.py --dry-run         # 仅扫描，显示待转换统计
-  python scripts/convert_to_qlib.py --fields open,high  # 仅重建指定字段
-        """,
     )
     parser.add_argument("--daily", action="store_true",
                        help="每日增量同步")
@@ -299,9 +301,9 @@ def _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output
         print(f"\n! 发现 {len(partials)} 个未完成同步任务，将重新执行:")
         for p in partials:
             print(f"  {p['instrument']} ← {p['source_table']}")
-        for p in partials:
-            field_names = json.loads(p["fields_json"])
-            feature_sync._cleanup_partial_bins(p["instrument"], field_names)
+            feature_sync._cleanup_partial_bins(
+                p["instrument"], json.loads(p["fields_json"])
+            )
 
     print("[1/3] 初始化品种清单...")
     inst_sync.full_init(conn)
@@ -319,9 +321,8 @@ def _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output
     print(f"  instruments: {stats['total_instruments']} (written: {stats['total_written']}, skipped: {stats['total_skipped']})")
 
     print("[3/3] 生成 features_manifest.json...")
-    manifest = build_features_manifest(conversion_tables, calendar)
-    manifest["_meta"]["total_instruments"] = stats["total_written"]
-    write_manifest(output_dir, manifest)
+    manifest = _emit_manifest(output_dir, conversion_tables, calendar,
+                              total_instruments=stats["total_written"])
     print(f"  字段: {manifest['_meta']['total_fields']} 个")
 
 
@@ -343,8 +344,7 @@ def _cmd_daily(conn, conversion_tables, calendar, inst_sync, feature_sync, outpu
     idx_constituent_sync.full_sync(conn)
 
     print("[3/3] 更新 features_manifest.json...")
-    manifest = build_features_manifest(conversion_tables, calendar)
-    write_manifest(output_dir, manifest)
+    _emit_manifest(output_dir, conversion_tables, calendar)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,6 @@ class JsonLogger:
                 self._file.write(line)
                 self._file.flush()
         except Exception:
-            import sys
             try:
                 print(json.dumps(data, ensure_ascii=False, default=str),
                       file=sys.stderr, flush=True)

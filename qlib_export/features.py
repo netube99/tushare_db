@@ -94,12 +94,7 @@ class FeatureSync:
 
         since 为 None 时取 self.since；传 "" 则不做日期过滤（新 instrument 全量首转）.
         """
-        source_table = table_cfg["source_table"]
-        inst_col = table_cfg["inst_col"]
-        date_col = table_cfg["date_col"]
         fields = table_cfg["fields"]
-        agg = table_cfg.get("agg")
-        encode = table_cfg.get("encode")
 
         rows, col_names = self._query_instrument(inst, table_cfg, since=since)
 
@@ -108,13 +103,7 @@ class FeatureSync:
 
         raw_count = len(rows)
 
-        if agg:
-            rows, col_names = self._apply_aggregation(rows, col_names, table_cfg)
-
-        if encode:
-            rows, col_names = self._apply_encoding(rows, col_names, table_cfg)
-
-        arrays = self._align_to_calendar(rows, col_names, fields, date_col)
+        arrays = self._rows_to_arrays(rows, col_names, table_cfg, fields)
 
         inst_dir = self.output_dir / "features" / inst.lower()
         inst_dir.mkdir(parents=True, exist_ok=True)
@@ -126,43 +115,51 @@ class FeatureSync:
 
         return raw_count
 
+    def _inst_where(self, table_cfg: dict, inst: str,
+                    date_cond: tuple[str, str] | None = None) -> tuple[str, tuple]:
+        """构造 WHERE 子句: instrument 定位 + 可选 (op, value) 日期条件."""
+        conds: list[str] = []
+        params: list[str] = []
+        if table_cfg.get("virtual_inst"):
+            flt = table_cfg.get("inst_filter")
+            if flt:
+                conds.append(flt)
+        else:
+            conds.append(f'"{table_cfg["inst_col"]}" = ?')
+            params.append(qlib_to_ts_code(inst, table_cfg["inst_type"]))
+        if date_cond is not None:
+            op, val = date_cond
+            conds.append(f'"{table_cfg["date_col"]}" {op} ?')
+            params.append(val)
+        if not conds:
+            return "", ()
+        return " WHERE " + " AND ".join(conds), tuple(params)
+
+    def _rows_to_arrays(self, rows: list[tuple], col_names: list[str],
+                        table_cfg: dict, fields: list[dict]) -> list:
+        """按需聚合/编码后对齐日历，返回各字段数组."""
+        if table_cfg.get("agg"):
+            rows, col_names = self._apply_aggregation(rows, col_names, table_cfg)
+        if table_cfg.get("encode"):
+            rows, col_names = self._apply_encoding(rows, col_names, table_cfg)
+        return self._align_to_calendar(rows, col_names, fields, table_cfg["date_col"])
+
     def _query_instrument(self, inst: str, table_cfg: dict,
                           since: str | None = None) -> tuple[list[tuple], list[str]]:
         """查询单个 instrument 的原始数据.
 
         since 语义同 _convert_instrument：None 取 self.since，"" 不过滤.
         """
-        source_table = table_cfg["source_table"]
-        inst_col = table_cfg["inst_col"]
-        date_col = table_cfg["date_col"]
-        virtual_inst = table_cfg.get("virtual_inst")
-        inst_filter = table_cfg.get("inst_filter")
-
-        tushare_cols = _collect_tushare_cols(table_cfg)
-        cols_sql = ", ".join(f'"{c}"' for c in tushare_cols)
-
         if since is None:
             since = self.since
-        date_filter = ""
-        date_params: tuple = ()
-        if since:
-            date_filter = f' AND "{date_col}" >= ?'
-            date_params = (since,)
-
-        if virtual_inst:
-            if inst_filter:
-                query = (f'SELECT {cols_sql} FROM "{source_table}"'
-                         f' WHERE {inst_filter}{date_filter} ORDER BY "{date_col}"')
-            else:
-                query = (f'SELECT {cols_sql} FROM "{source_table}"'
-                         f' WHERE 1=1{date_filter} ORDER BY "{date_col}"')
-            rows = self.conn.execute(query, date_params).fetchall()
-        else:
-            ts_code = qlib_to_ts_code(inst, table_cfg["inst_type"])
-            query = (f'SELECT {cols_sql} FROM "{source_table}"'
-                     f' WHERE "{inst_col}" = ?{date_filter} ORDER BY "{date_col}"')
-            rows = self.conn.execute(query, (ts_code,) + date_params).fetchall()
-
+        tushare_cols = _collect_tushare_cols(table_cfg)
+        cols_sql = ", ".join(f'"{c}"' for c in tushare_cols)
+        where, params = self._inst_where(
+            table_cfg, inst, (">=", since) if since else None
+        )
+        query = (f'SELECT {cols_sql} FROM "{table_cfg["source_table"]}"'
+                 f'{where} ORDER BY "{table_cfg["date_col"]}"')
+        rows = self.conn.execute(query, params).fetchall()
         return [tuple(r) for r in rows], tushare_cols
 
     def _apply_aggregation(self, rows: list[tuple], col_names: list[str],
@@ -172,10 +169,8 @@ class FeatureSync:
 
         if agg_type == "split_by_type":
             return self._agg_split_by_type(rows, col_names, table_cfg)
-        elif agg_type in ("sum_count", "sum_count_weighted"):
+        if agg_type in ("sum_count", "sum_count_weighted", "count"):
             return self._agg_sum_count(rows, col_names, table_cfg)
-        elif agg_type == "count":
-            return self._agg_count(rows, col_names, table_cfg)
 
         return rows, col_names
 
@@ -218,26 +213,22 @@ class FeatureSync:
         return result, new_cols
 
     def _agg_sum_count(self, rows, col_names, table_cfg):
-        """对数值列 SUM + COUNT 聚合."""
+        """按日期分组聚合: COUNT / computed sum / 加权均值 / 列 SUM."""
         date_col = table_cfg["date_col"]
         fields = table_cfg["fields"]
         agg_weighted = table_cfg.get("agg_weighted_cols", {})
-        agg_count_col = table_cfg.get("agg_count_col", "")
 
         date_idx = col_names.index(date_col)
 
         col_idx = {c: i for i, c in enumerate(col_names)}
 
-        by_date = defaultdict(list)
+        by_date: dict[str, list[tuple]] = defaultdict(list)
         for row in rows:
             d = row[date_idx]
             by_date[d].append(row)
 
         result = []
-        new_cols = [date_col]
-
-        for fdef in fields:
-            new_cols.append(fdef["bin_name"])
+        new_cols = [date_col] + [f["bin_name"] for f in fields]
 
         for d in sorted(by_date.keys()):
             group = by_date[d]
@@ -250,6 +241,12 @@ class FeatureSync:
 
                 if computed == "count":
                     vals.append(len(group))
+                elif computed == "sum" and fdef.get("agg_sum_col"):
+                    sum_idx = col_idx.get(fdef["agg_sum_col"], -1)
+                    if sum_idx >= 0:
+                        vals.append(sum(float(r[sum_idx]) if r[sum_idx] is not None else 0 for r in group))
+                    else:
+                        vals.append(np.nan)
                 elif is_weighted and tcol and weight_col in col_idx:
                     w_idx = col_idx[weight_col]
                     tc_idx = col_idx[tcol]
@@ -267,40 +264,6 @@ class FeatureSync:
                     tc_idx = col_idx[tcol]
                     s = sum(float(r[tc_idx]) if r[tc_idx] is not None else 0 for r in group)
                     vals.append(s)
-                else:
-                    vals.append(np.nan)
-            result.append(tuple(vals))
-
-        return result, new_cols
-
-    def _agg_count(self, rows, col_names, table_cfg):
-        """对 COUNT 聚合（kpl_concept_cons）."""
-        date_col = table_cfg["date_col"]
-        fields = table_cfg["fields"]
-        date_idx = col_names.index(date_col)
-
-        by_date = defaultdict(list)
-        for row in rows:
-            d = row[date_idx]
-            by_date[d].append(row)
-
-        result = []
-        new_cols = [date_col] + [f["bin_name"] for f in fields]
-
-        for d in sorted(by_date.keys()):
-            group = by_date[d]
-            vals = [d]
-            for fdef in fields:
-                computed = fdef.get("computed")
-                agg_sum_col = fdef.get("agg_sum_col")
-                if computed == "count":
-                    vals.append(len(group))
-                elif computed == "sum" and agg_sum_col:
-                    sum_idx = col_names.index(agg_sum_col) if agg_sum_col in col_names else -1
-                    if sum_idx >= 0:
-                        vals.append(sum(float(r[sum_idx]) if r[sum_idx] is not None else 0 for r in group))
-                    else:
-                        vals.append(np.nan)
                 else:
                     vals.append(np.nan)
             result.append(tuple(vals))
@@ -427,25 +390,12 @@ class FeatureSync:
 
     def _get_date_bound(self, inst: str, table_cfg: dict, agg_fn: str) -> str:
         """获取该 instrument 数据的日期边界（agg_fn = "MAX" 或 "MIN"）."""
-        source_table = table_cfg["source_table"]
         date_col = table_cfg["date_col"]
-        virtual_inst = table_cfg.get("virtual_inst")
-        inst_filter = table_cfg.get("inst_filter")
-
-        if virtual_inst:
-            if inst_filter:
-                query = f'SELECT {agg_fn}("{date_col}") FROM "{source_table}" WHERE {inst_filter}'
-            else:
-                query = f'SELECT {agg_fn}("{date_col}") FROM "{source_table}"'
-            row = self.conn.execute(query).fetchone()
-        else:
-            ts_code = qlib_to_ts_code(inst, table_cfg["inst_type"])
-            inst_col = table_cfg["inst_col"]
-            row = self.conn.execute(
-                f'SELECT {agg_fn}("{date_col}") FROM "{source_table}" WHERE "{inst_col}" = ?',
-                (ts_code,)
-            ).fetchone()
-
+        where, params = self._inst_where(table_cfg, inst)
+        row = self.conn.execute(
+            f'SELECT {agg_fn}("{date_col}") FROM "{table_cfg["source_table"]}"{where}',
+            params,
+        ).fetchone()
         return row[0] if row and row[0] else ""
 
     def resume_check(self) -> list[dict]:

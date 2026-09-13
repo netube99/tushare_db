@@ -16,7 +16,7 @@ import sys
 import time
 
 sys.path.insert(0, '.')
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from database import get_conn, load_config, DataClient
 from database.etl import REGISTRY, log_pull
 import database.etl as _etl_module
@@ -80,39 +80,51 @@ def _resolve_until() -> str:
     return until_date.strftime("%Y%m%d")
 
 
+def _api_spec(entry: dict) -> dict | None:
+    """api_index.json 中该 entry 的原始接口定义."""
+    from database.utils import load_api_registry
+    return next((a for a in load_api_registry()
+                 if a["api_name"] == entry["api"]), None)
+
+
 def _get_date_params(entry: dict) -> dict:
     """通过 input_params 判断日期参数类型，支持 param_fixes 和 domain 策略."""
-    from database.utils import load_api_registry
-    api_list = load_api_registry()
+    api = _api_spec(entry)
+    if api is None:
+        return {"strategy": "once", "date_col": None}
 
-    for api in api_list:
-        if api["api_name"] == entry["api"]:
-            fixes = _apply_param_fixes(api)
-            active_params = fixes["active_params"]
-            is_required = fixes["is_required"]
+    fixes = _apply_param_fixes(api)
+    active_params = fixes["active_params"]
+    is_required = fixes["is_required"]
 
-            driver = entry.get("driver")
-            if driver:
-                return {"strategy": "domain",
-                        "date_col": entry.get("date_col"),
-                        "date_mode": driver.get("date_mode"),
-                        "driver": driver}
+    driver = entry.get("driver")
+    if driver:
+        return {"strategy": "domain",
+                "date_col": entry.get("date_col"),
+                "date_mode": driver.get("date_mode"),
+                "driver": driver}
 
-            if any(p["name"] == "freq" and is_required(p["name"])
-                   for p in api.get("input_params", [])):
-                return {"strategy": "freq", "date_col": "trade_date",
-                        "freq_values": DEFAULT_FREQ_VALUES}
-            if "trade_date" in active_params:
-                return {"strategy": "trade_date", "date_col": "trade_date",
-                        "iter_mode": "trading"}
-            if "ann_date" in active_params:
-                return {"strategy": "trade_date", "date_col": "ann_date",
-                        "iter_mode": "calendar"}
-            if "start_date" in active_params and "end_date" in active_params:
-                return {"strategy": "date_range",
-                        "date_col": entry.get("date_col", "trade_date")}
-
+    if any(p["name"] == "freq" and is_required(p["name"])
+           for p in api.get("input_params", [])):
+        return {"strategy": "freq", "date_col": "trade_date",
+                "freq_values": DEFAULT_FREQ_VALUES}
+    if "trade_date" in active_params:
+        return {"strategy": "trade_date", "date_col": "trade_date",
+                "iter_mode": "trading"}
+    if "ann_date" in active_params:
+        return {"strategy": "trade_date", "date_col": "ann_date",
+                "iter_mode": "calendar"}
+    if "start_date" in active_params and "end_date" in active_params:
+        return {"strategy": "date_range",
+                "date_col": entry.get("date_col", "trade_date")}
     return {"strategy": "once", "date_col": None}
+
+
+def _find_entry(table: str | None = None, api: str | None = None) -> dict | None:
+    """按 table 或 api 在 REGISTRY 中查找 entry."""
+    if table is not None:
+        return next((e for e in REGISTRY if e.get("table") == table), None)
+    return next((e for e in REGISTRY if e["api"] == api), None)
 
 
 def _pull_and_store(conn, table: str, df, date_val: str,
@@ -123,7 +135,7 @@ def _pull_and_store(conn, table: str, df, date_val: str,
     """
     if df is not None and not df.empty:
         try:
-            entry = next((e for e in REGISTRY if e.get("table") == table), None)
+            entry = _find_entry(table=table)
             pkey = entry.get("partition_key") if entry else None
             if pkey and pkey in df.columns:
                 # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）；
@@ -135,10 +147,7 @@ def _pull_and_store(conn, table: str, df, date_val: str,
             n = upsert_df(conn, table, df,
                           drop_null_pk=not bool(entry and entry.get("null_pk_keep")),
                           replace_all=not bool(entry and entry.get("partition_key")))
-            if log_prefix:
-                logger.info(f"{log_prefix}{table}: {n} rows")
-            else:
-                logger.info(f"[maintain] {table}: {n} rows")
+            logger.info(f"{log_prefix}{table}: {n} rows")
             log_pull(conn, table, date_val, 1, api=api_name, rows=n, strategy=strategy)
             return True
         except Exception as e:
@@ -149,6 +158,41 @@ def _pull_and_store(conn, table: str, df, date_val: str,
     else:
         log_pull(conn, table, date_val, 2, api=api_name, strategy=strategy)
         return True
+
+
+def _pull_once(conn, dc, entry, date_val: str, strategy: str, pfx: str,
+               label: str | None = None, **kwargs) -> bool | None:
+    """单次调用 + 错误归类 + 落库.
+
+    Returns: True=已处理, False=错误已记 ok=0, None=天级限流（调用方决定 break/return）.
+    """
+    api_name = entry["api"]
+    table = entry["table"]
+    name = label or api_name
+    try:
+        df = getattr(dc, api_name)(**kwargs)
+    except DailyLimitError as e:
+        logger.error(f"{pfx}{name} 天级限流: {e}")
+        return None
+    except TushareError as e:
+        logger.error(f"{pfx}{name} Tushare错误: {e}")
+        log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
+        return False
+    except Exception as e:
+        logger.error(f"{pfx}{name} 调用异常: {e}")
+        log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
+        return False
+    _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx)
+    return True
+
+
+def _done_count(conn, table: str, date_val: str,
+                ok_filter: str = "ok IN (1,2)") -> int:
+    """pull_log 中 (table, date_val) 已完成（命中 ok_filter）的条数，>0 即跳过."""
+    return conn.execute(
+        f"SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND {ok_filter}",
+        (table, date_val),
+    ).fetchone()[0]
 
 
 def _cal_query(conn, select="cal_date", since=None, until=None,
@@ -187,21 +231,22 @@ def _dispatch_strategy(conn, dc, entry, strategy=None, since=None, until=None,
 
 def _auto_fix_bounds(strategy: dict, date_val: str) -> tuple[str | None, str | None, str | None]:
     """从 pull_log date_val 解析各策略的 since/until/(filter_date_val).
-    返回 (since, until, filter_date_val).
+
+    Returns: (since, until, filter_date_val).
     """
-    strat_name = strategy["strategy"]
-    if strat_name == "trade_date":
-        return date_val, date_val, None
-    elif strat_name == "date_range":
-        year = date_val[:4]
-        return f"{year}0101", f"{year}1231", None
-    elif strat_name == "freq":
-        td, _, _ = date_val.partition("_")
-        return td, td, None
-    elif strat_name == "domain":
-        return None, _resolve_until(), date_val
-    else:
-        return None, None, None
+    match strategy["strategy"]:
+        case "trade_date":
+            return date_val, date_val, None
+        case "date_range":
+            year = date_val[:4]
+            return f"{year}0101", f"{year}1231", None
+        case "freq":
+            td, _, _ = date_val.partition("_")
+            return td, td, None
+        case "domain":
+            return None, _resolve_until(), date_val
+        case _:
+            return None, None, None
 
 
 def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: str | None = None,
@@ -221,17 +266,11 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
             since = DEFAULT_BACKFILL_SINCE
         if not until:
             until = beijing_now().strftime("%Y%m%d")
-        from datetime import date as dt_date
-        sy = int(since[:4]); sm = int(since[4:6]); sd = int(since[6:8])
-        ey = int(until[:4]); em = int(until[4:6]); ed = int(until[6:8])
-        start_d = dt_date(sy, sm, sd)
-        end_d = dt_date(ey, em, ed)
-        total_days = (end_d - start_d).days + 1
-        iter_dates = []
-        for d_idx in range(total_days):
-            d = start_d + timedelta(days=d_idx)
-            iter_dates.append((d.strftime("%Y%m%d"),))
-        iter_dates.reverse()
+        start_d = datetime.strptime(since, "%Y%m%d").date()
+        end_d = datetime.strptime(until, "%Y%m%d").date()
+        days = [(start_d + timedelta(days=n)).strftime("%Y%m%d")
+                for n in range((end_d - start_d).days + 1)]
+        iter_dates = [(d,) for d in reversed(days)]
     else:
         iter_dates = _cal_query(conn, since=since, until=until)
         if not iter_dates:
@@ -242,37 +281,20 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
             iter_dates = _cal_query(conn, since=since, until=until)
 
     # 查出已完成(ok=1)和确认空(ok=2)的日期，都不重拉
-    done_dates = set()
-    for row in conn.execute(
+    done_dates = {r[0] for r in conn.execute(
         'SELECT date_val FROM pull_log WHERE table_name=? AND ok IN (1,2)', (table,)
-    ).fetchall():
-        done_dates.add(row[0])
+    ).fetchall()}
 
-    api_func = getattr(dc, api_name)
     total = len(iter_dates)
     filled = 0
-
     for i, (td,) in enumerate(iter_dates):
         if td in done_dates:
             filled += 1
             continue
-
         logger.info(f"{_pfx}{api_name}({date_col}={td}) → {table} [{i+1}/{total}]")
-        try:
-            df = api_func(**{date_col: td})
-        except DailyLimitError as e:
-            logger.error(f"{_pfx}{api_name} 天级限流: {e}")
+        res = _pull_once(conn, dc, entry, td, "trade_date", _pfx, **{date_col: td})
+        if res is None:
             break
-        except TushareError as e:
-            logger.error(f"{_pfx}{api_name} Tushare错误: {e}")
-            log_pull(conn, table, td, 0, api=api_name, strategy="trade_date")
-            continue
-        except Exception as e:
-            logger.error(f"{_pfx}{api_name} 调用异常: {e}")
-            log_pull(conn, table, td, 0, api=api_name, strategy="trade_date")
-            continue
-
-        _pull_and_store(conn, table, df, td, api_name, "trade_date", _pfx)
         filled += 1
 
     logger.info(f"{_pfx}{api_name}: {filled}/{total} 完成")
@@ -291,36 +313,17 @@ def _run_date_range_strategy(conn, dc, entry, since: str | None = None, until: s
         logger.warning(f"{_pfx}{api_name}: 无交易日历")
         return
 
-    api_func = getattr(dc, api_name)
     for year in years:
-        start = f"{year}0101"
-        end = f"{year}1231"
-
-        # 检查是否已完成
-        done = conn.execute(
-            'SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND ok IN (1,2)',
-            (table, year)
-        ).fetchone()[0]
-        if done:
+        if _done_count(conn, table, year):
             logger.info(f"{_pfx}{api_name} {year}: 已完成，跳过")
             continue
-
-        logger.info(f"{_pfx}{api_name}(start_date={start}, end_date={end}) → {table}")
-        try:
-            df = api_func(start_date=start, end_date=end)
-        except DailyLimitError as e:
-            logger.error(f"{_pfx}{api_name} {year} 天级限流: {e}")
+        logger.info(
+            f"{_pfx}{api_name}(start_date={year}0101, end_date={year}1231) → {table}")
+        res = _pull_once(conn, dc, entry, year, "date_range", _pfx,
+                         label=f"{api_name} {year}",
+                         start_date=f"{year}0101", end_date=f"{year}1231")
+        if res is None:
             break
-        except TushareError as e:
-            logger.error(f"{_pfx}{api_name} {year} Tushare错误: {e}")
-            log_pull(conn, table, year, 0, api=api_name, strategy="date_range")
-            continue
-        except Exception as e:
-            logger.error(f"{_pfx}{api_name} {year} 调用异常: {e}")
-            log_pull(conn, table, year, 0, api=api_name, strategy="date_range")
-            continue
-
-        _pull_and_store(conn, table, df, year, api_name, "date_range", _pfx)
 
 
 def _run_once_strategy(conn, dc, entry, progress: tuple[int, int] | None = None):
@@ -329,32 +332,12 @@ def _run_once_strategy(conn, dc, entry, progress: tuple[int, int] | None = None)
     table = entry["table"]
     _pfx = _make_pfx(progress)
 
-    done = conn.execute(
-        'SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND ok IN (1,2)',
-        (table, "__once__")
-    ).fetchone()[0]
-    if done:
+    if _done_count(conn, table, "__once__"):
         logger.info(f"{_pfx}{api_name}: 已完成（一次性），跳过")
         return
-
     logger.info(f"{_pfx}{api_name} → {table}")
-    api_func = getattr(dc, api_name)
-    kwargs = entry.get("default_params", {})
-    try:
-        df = api_func(**kwargs)
-    except DailyLimitError as e:
-        logger.error(f"{_pfx}{api_name} 天级限流: {e}")
-        return
-    except TushareError as e:
-        logger.error(f"{_pfx}{api_name} Tushare错误: {e}")
-        log_pull(conn, table, "__once__", 0, api=api_name, strategy="once")
-        return
-    except Exception as e:
-        logger.error(f"{_pfx}{api_name} 调用异常: {e}")
-        log_pull(conn, table, "__once__", 0, api=api_name, strategy="once")
-        return
-
-    _pull_and_store(conn, table, df, "__once__", api_name, "once", _pfx)
+    _pull_once(conn, dc, entry, "__once__", "once", _pfx,
+               **entry.get("default_params", {}))
 
 
 def _run_freq_strategy(conn, dc, entry, since=None, until=None,
@@ -366,8 +349,6 @@ def _run_freq_strategy(conn, dc, entry, since=None, until=None,
     _pfx = _make_pfx(progress)
 
     trading_days = _cal_query(conn, since=since, until=until)
-
-    api_func = getattr(dc, api_name)
     total = len(trading_days) * len(freq_values)
     filled = 0
 
@@ -375,30 +356,14 @@ def _run_freq_strategy(conn, dc, entry, since=None, until=None,
         for fv_idx, fv in enumerate(freq_values):
             seq = td_idx * len(freq_values) + fv_idx + 1
             date_key = f"{td}_{fv}"
-            done = conn.execute(
-                'SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND ok IN (1,2)',
-                (table, date_key)
-            ).fetchone()[0]
-            if done:
+            if _done_count(conn, table, date_key):
                 filled += 1
                 continue
-
             logger.info(f"{_pfx}{api_name}(trade_date={td}, freq={fv}) → {table} [{seq}/{total}]")
-            try:
-                df = api_func(trade_date=td, freq=fv)
-            except DailyLimitError as e:
-                logger.error(f"{_pfx}{api_name} 天级限流: {e}")
+            res = _pull_once(conn, dc, entry, date_key, "freq", _pfx,
+                             trade_date=td, freq=fv)
+            if res is None:
                 return
-            except TushareError as e:
-                logger.error(f"{_pfx}{api_name} Tushare错误: {e}")
-                log_pull(conn, table, date_key, 0, api=api_name, strategy="freq")
-                continue
-            except Exception as e:
-                logger.error(f"{_pfx}{api_name} 调用异常: {e}")
-                log_pull(conn, table, date_key, 0, api=api_name, strategy="freq")
-                continue
-
-            _pull_and_store(conn, table, df, date_key, api_name, "freq", _pfx)
             filled += 1
 
     logger.info(f"{_pfx}{api_name}: {filled}/{total} 完成")
@@ -441,15 +406,14 @@ def _find_domain_param(entry: dict) -> str | None:
         "trade_date", "start_date", "end_date", "ann_date",
         "freq", "offset", "limit", "fields",
     }
-    from database.utils import load_api_registry
-    api_list = load_api_registry()
-    for api in api_list:
-        if api["api_name"] == entry["api"]:
-            fixes = _apply_param_fixes(api)
-            candidates = [p["name"] for p in api.get("input_params", [])
-                         if fixes["is_required"](p["name"]) and p["name"] not in DATE_PAGINATION]
-            return candidates[0] if candidates else None
-    return None
+    api = _api_spec(entry)
+    if api is None:
+        return None
+    fixes = _apply_param_fixes(api)
+    candidates = [p["name"] for p in api.get("input_params", [])
+                  if fixes["is_required"](p["name"])
+                  and p["name"] not in DATE_PAGINATION]
+    return candidates[0] if candidates else None
 
 
 def _apply_param_fixes(api: dict) -> dict:
@@ -522,7 +486,7 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
             domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
         except Exception:
             logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不可用，尝试拉取")
-            drv_entry = next((e for e in REGISTRY if e["table"] == source_table), None)
+            drv_entry = _find_entry(table=source_table)
             if drv_entry:
                 _run_once_strategy(conn, dc, drv_entry)
                 domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
@@ -547,12 +511,10 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
         logger.error(f"{_pfx}{api_name}: 无法确定域参数名")
         return
 
-    api_func = getattr(dc, api_name)
-    total = len(domain_vals) * len(periods)
     filled = 0
     skipped = 0
     # 最新周期（当前月/年）不因 ok=2 跳过，允许每日重试等数据就绪
-    latest_period_key = periods[0][0] if periods else None
+    latest_period_key = periods[0][0]
 
     for dv in domain_vals:
         for period in periods:
@@ -567,29 +529,17 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
             if filter_date_val is not None and date_val != filter_date_val:
                 continue
 
-            # 5. 跳过已完成
+            # 跳过已完成；once 模式 ok=2 也跳过，最新周期仅 ok=1 跳过（ok=2 每日重试）
             if date_mode == "once" or period_key != latest_period_key:
-                # once 模式 ok=2 也跳过；非最新周期 ok=2 也跳过
-                done = conn.execute(
-                    "SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND ok IN (1,2)",
-                    (table, date_val)
-                ).fetchone()[0]
+                ok_filter = "ok IN (1,2)"
             else:
-                # 最新周期仅跳过 ok=1，ok=2 每日重试
-                done = conn.execute(
-                    "SELECT COUNT(*) FROM pull_log WHERE table_name=? AND date_val=? AND ok=1",
-                    (table, date_val)
-                ).fetchone()[0]
-            if done:
+                ok_filter = "ok=1"
+            if _done_count(conn, table, date_val, ok_filter):
                 skipped += 1
                 continue
 
-            # 6. 组装参数并拉取
             kwargs = {param_name: dv}
-            if date_mode == "monthly":
-                kwargs["start_date"] = period[1]
-                kwargs["end_date"] = period[2]
-            elif date_mode == "yearly":
+            if date_mode in ("monthly", "yearly"):
                 kwargs["start_date"] = period[1]
                 kwargs["end_date"] = period[2]
             elif date_mode == "daily":
@@ -598,23 +548,11 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
 
             logger.info(f"{_pfx}{api_name}({param_name}={dv}, period={period_key}) → {table}")
 
-            try:
-                df = api_func(**kwargs)
-            except DailyLimitError as e:
-                logger.error(f"{_pfx}{api_name} 天级限流: {e}")
+            res = _pull_once(conn, dc, entry, date_val, "domain", _pfx, **kwargs)
+            if res is None:
                 logger.info(f"{_pfx}{api_name}: {filled} 次拉取, {skipped} 跳过, "
                             f"共 {len(domain_vals)} 域 × {len(periods)} 周期（限流中断）")
                 return
-            except TushareError as e:
-                logger.error(f"{_pfx}{api_name} Tushare错误: {e}")
-                log_pull(conn, table, date_val, 0, api=api_name, strategy="domain")
-                continue
-            except Exception as e:
-                logger.error(f"{_pfx}{api_name} 调用异常: {e}")
-                log_pull(conn, table, date_val, 0, api=api_name, strategy="domain")
-                continue
-
-            _pull_and_store(conn, table, df, date_val, api_name, "domain", _pfx)
             filled += 1
 
     logger.info(f"{_pfx}{api_name}: {filled} 次拉取, {skipped} 跳过, "
@@ -656,11 +594,12 @@ _INFRA_FALLBACK = {
 }
 
 
-def _run_infra_script(step_name: str, script_path: str, jlog) -> bool:
+def _run_infra_script(step_name: str, script_name: str, jlog) -> bool:
     """运行 infra 子脚本（重分类/重生成）；失败时记录日志并沿用既有产物."""
     import subprocess
     fallback = _INFRA_FALLBACK.get(step_name, "沿用既有产物")
-    script_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
+    script_root = os.path.dirname(os.path.dirname(script_path))
     logger.info(f"[infra] {step_name}…")
     try:
         subprocess.run([sys.executable, script_path],
@@ -688,15 +627,11 @@ def _run_infrastructure(config, conn, dc):
     from database.logger import get_json_logger
     jlog = get_json_logger()
 
-    _script_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
     # 1. 重分类
-    _run_infra_script("classify_apis",
-                      os.path.join(_script_root, "scripts", "classify_apis.py"), jlog)
+    _run_infra_script("classify_apis", "classify_apis.py", jlog)
 
     # 2. 重生成
-    _run_infra_script("generate_schema",
-                      os.path.join(_script_root, "scripts", "generate_schema.py"), jlog)
+    _run_infra_script("generate_schema", "generate_schema.py", jlog)
 
     # 2.5 重载 DC 规则（api_index.json 已被 subprocess 更新，先清缓存）
     from database.utils import load_api_registry, invalidate_registry_cache
@@ -713,38 +648,35 @@ def _run_infrastructure(config, conn, dc):
     init_schema(conn)
 
     # 3. 日历补拉
+    def pull_cal(**kw) -> None:
+        df = dc.trade_cal(**kw)
+        if not df.empty:
+            upsert_df(conn, "trade_cal", df)
+
     cal_count = conn.execute("SELECT COUNT(*) FROM trade_cal").fetchone()[0]
     if cal_count == 0:
         logger.info("[infra] 日历为空，拉取…")
-        df = dc.trade_cal()
-        if not df.empty:
-            upsert_df(conn, "trade_cal", df)
+        pull_cal()
     else:
         max_cal = conn.execute(
             "SELECT MAX(cal_date) FROM trade_cal WHERE is_open=1"
         ).fetchone()[0]
         if max_cal:
-            max_dt = date(int(max_cal[:4]), int(max_cal[4:6]), int(max_cal[6:]))
+            max_dt = datetime.strptime(max_cal, "%Y%m%d").date()
             today = beijing_today()
             if max_dt < today:
                 start = (max_dt + timedelta(days=1)).strftime("%Y%m%d")
                 logger.info(f"[infra] 日历落后于当前日期，补拉 {start} → {today}")
-                df = dc.trade_cal(start_date=start,
-                                  end_date=today.strftime("%Y%m%d"))
-                if not df.empty:
-                    upsert_df(conn, "trade_cal", df)
+                pull_cal(start_date=start, end_date=today.strftime("%Y%m%d"))
             elif (max_dt - today).days <= 7:
                 next_year = max_dt.year + 1
                 logger.info(f"[infra] 日历快到底，补拉 {next_year}")
-                df = dc.trade_cal(
-                    start_date=f"{next_year}0101", end_date=f"{next_year}1231")
-                if not df.empty:
-                    upsert_df(conn, "trade_cal", df)
+                pull_cal(start_date=f"{next_year}0101", end_date=f"{next_year}1231")
 
     # 4. 刷新基础设施 once 表
     total_stocks = 0
     for api_name in INFRA_ONCE:
-        entry = next((e for e in REGISTRY if e["api"] == api_name), None)
+        entry = _find_entry(api=api_name)
         if not entry:
             logger.warning(f"[infra] {api_name} 不在 REGISTRY 中，跳过")
             continue
@@ -784,7 +716,7 @@ def _classify_empty_table(conn, table: str) -> tuple[str, int]:
     return ("untouched", 0) if pl == 0 else ("empty", pl)
 
 
-def _verify(conn, report_issues=True, integrity_check=False) -> dict:
+def _verify(conn, integrity_check=False) -> dict:
     """生成质检报告，只读不写.
 
     Args:
@@ -806,61 +738,57 @@ def _verify(conn, report_issues=True, integrity_check=False) -> dict:
 
     config = load_config()
     cal_since = config.get("backfill_since", DEFAULT_BACKFILL_SINCE)
-    trading_days = {
-        r[0] for r in _cal_query(conn, since=cal_since,
-                                 until=beijing_today().strftime("%Y%m%d"))
-    }
+    today_str = beijing_today().strftime("%Y%m%d")
+    trading_days = {r[0] for r in _cal_query(conn, since=cal_since, until=today_str)}
 
-    perfect, small_gap, big_gap, empty, untouched = 0, 0, 0, 0, 0
+    stats = dict.fromkeys(("perfect", "small_gap", "big_gap", "empty", "untouched"), 0)
     total_rows = 0
-    anomalies = []
+    anomalies: list[tuple] = []
+
+    def mark_empty(table: str) -> None:
+        status, pl = _classify_empty_table(conn, table)
+        if status == "untouched":
+            stats["untouched"] += 1
+        else:
+            stats["empty"] += 1
+            anomalies.append((table, "空表", f"pull_log={pl}"))
+
+    def grade(table: str, pct: float, detail: str) -> None:
+        if pct >= 99.9:
+            stats["perfect"] += 1
+        elif pct >= 95:
+            stats["small_gap"] += 1
+        else:
+            stats["big_gap"] += 1
+        if pct < 99.9:
+            anomalies.append((table, f"{pct:.1f}%", detail))
 
     for entry in REGISTRY:
         table = entry["table"]
-        dc_col = entry.get("date_col")
+        cnt = _count_table(conn, table)
+        total_rows += cnt
+        if cnt == 0:
+            mark_empty(table)
+            continue
 
         # domain 表：按 date_mode 做覆盖质检
         driver = entry.get("driver")
         if driver:
             param_name = _find_domain_param(entry)
             dm = driver["date_mode"]
-            domain_date_col = entry.get("date_col") or "trade_date"
-            cnt = _count_table(conn, table)
-            total_rows += cnt
-
-            if cnt == 0:
-                status, pl = _classify_empty_table(conn, table)
-                if status == "untouched":
-                    untouched += 1
-                else:
-                    empty += 1
-                    anomalies.append((table, "空表", f"pull_log={pl}"))
-                continue
-
-            # 按 date_mode 计算周期覆盖
-            if dm == "monthly":
+            dcol = entry.get("date_col") or "trade_date"
+            if dm in ("monthly", "yearly"):
+                n = 6 if dm == "monthly" else 4
                 expected = {r[0] for r in conn.execute(
-                    "SELECT DISTINCT substr(cal_date,1,6) FROM trade_cal "
+                    f"SELECT DISTINCT substr(cal_date,1,{n}) FROM trade_cal "
                     "WHERE is_open=1 AND cal_date >= ? AND cal_date <= ?",
-                    (cal_since, beijing_today().strftime("%Y%m%d"),)
-                ).fetchall()}
+                    (cal_since, today_str)).fetchall()}
                 actual = {r[0] for r in conn.execute(
-                    f'SELECT DISTINCT substr("{domain_date_col}",1,6) FROM "{table}"'
-                ).fetchall()}
-            elif dm == "yearly":
-                expected = {r[0] for r in conn.execute(
-                    "SELECT DISTINCT substr(cal_date,1,4) FROM trade_cal "
-                    "WHERE is_open=1 AND cal_date >= ? AND cal_date <= ?",
-                    (cal_since, beijing_today().strftime("%Y%m%d"),)
-                ).fetchall()}
-                actual = {r[0] for r in conn.execute(
-                    f'SELECT DISTINCT substr("{domain_date_col}",1,4) FROM "{table}"'
-                ).fetchall()}
+                    f'SELECT DISTINCT substr("{dcol}",1,{n}) FROM "{table}"').fetchall()}
             else:  # daily
                 expected = trading_days
                 actual = {r[0] for r in conn.execute(
-                    f'SELECT DISTINCT "{domain_date_col}" FROM "{table}"'
-                ).fetchall()}
+                    f'SELECT DISTINCT "{dcol}" FROM "{table}"').fetchall()}
 
             if not param_name:
                 anomalies.append((table, "无域参数", ""))
@@ -869,74 +797,37 @@ def _verify(conn, report_issues=True, integrity_check=False) -> dict:
             codes = conn.execute(
                 f'SELECT COUNT(DISTINCT "{param_name}") FROM "{table}"').fetchone()[0]
             coverage = len(actual) / len(expected) * 100 if expected else 0
-
-            if coverage >= 99.9:
-                perfect += 1
-            elif coverage >= 95:
-                small_gap += 1
-                anomalies.append((table, f"{coverage:.1f}%",
-                                  f"{codes}域 × {len(actual)}/{len(expected)}周期"))
-            else:
-                big_gap += 1
-                anomalies.append((table, f"{coverage:.1f}%",
-                                  f"{codes}域 × {len(actual)}/{len(expected)}周期"))
+            grade(table, coverage, f"{codes}域 × {len(actual)}/{len(expected)}周期")
 
             # 逐 code 异常检测（月度以上才做，避免日频性能爆炸）
             if dm in ("monthly", "yearly"):
-                for code_row in conn.execute(
-                    f'SELECT DISTINCT "{param_name}" FROM "{table}"').fetchall():
-                    code = code_row[0]
+                for (code,) in conn.execute(
+                        f'SELECT DISTINCT "{param_name}" FROM "{table}"'):
                     code_periods = conn.execute(
-                        f'SELECT COUNT(DISTINCT substr("{domain_date_col}",1,{6 if dm=="monthly" else 4})) '
-                        f'FROM "{table}" WHERE "{param_name}"=?', (code,)).fetchone()[0]
+                        f'SELECT COUNT(DISTINCT substr("{dcol}",1,{n})) '
+                        f'FROM "{table}" WHERE "{param_name}"=?',
+                        (code,)).fetchone()[0]
                     if len(expected) > 12 and code_periods < len(expected) * 0.3:
                         anomalies.append((table, f"{code}: {code_periods}/{len(expected)}周期",
                                           "可能退市或停更"))
             continue
 
-        if dc_col:
-            cnt = _count_table(conn, table)
-            total_rows += cnt
-            if cnt == 0:
-                status, pl = _classify_empty_table(conn, table)
-                if status == "untouched":
-                    untouched += 1
-                else:
-                    empty += 1
-                    anomalies.append((table, "空表", f"pull_log={pl}"))
-                continue
+        dc_col = entry.get("date_col")
+        if not dc_col:
+            continue
+        try:
+            actual = {r[0] for r in conn.execute(
+                f'SELECT DISTINCT "{dc_col}" FROM "{table}"').fetchall()}
+        except Exception:
+            actual = set()
+        fill = len(actual & trading_days) / len(trading_days) * 100 if trading_days else 0
+        grade(table, fill, f"缺{len(trading_days - actual)}天")
 
-            try:
-                actual = {r[0] for r in conn.execute(
-                    f'SELECT DISTINCT "{dc_col}" FROM "{table}"'
-                ).fetchall()}
-            except Exception:
-                actual = set()
-            fill = len(actual & trading_days) / len(trading_days) * 100 if trading_days else 0
-            missing = len(trading_days - actual)
-
-            if fill >= 99.9:
-                perfect += 1
-            elif fill >= 95:
-                small_gap += 1
-                anomalies.append((table, f"{fill:.1f}%", f"缺{missing}天"))
-            else:
-                big_gap += 1
-                anomalies.append((table, f"{fill:.1f}%", f"缺{missing}天"))
-        else:
-            cnt = _count_table(conn, table)
-            total_rows += cnt
-            if cnt == 0:
-                status, pl = _classify_empty_table(conn, table)
-                if status == "untouched":
-                    untouched += 1
-                else:
-                    empty += 1
-                    anomalies.append((table, "空表", f"pull_log={pl}"))
-
-    pl_ok = conn.execute("SELECT COUNT(*) FROM pull_log WHERE ok=1").fetchone()[0]
-    pl_empty = conn.execute("SELECT COUNT(*) FROM pull_log WHERE ok=2").fetchone()[0]
-    pl_fail = conn.execute("SELECT COUNT(*) FROM pull_log WHERE ok=0").fetchone()[0]
+    pl_counts = {r[0]: r[1] for r in
+                 conn.execute("SELECT ok, COUNT(*) FROM pull_log GROUP BY ok")}
+    pl_ok = pl_counts.get(1, 0)
+    pl_empty = pl_counts.get(2, 0)
+    pl_fail = pl_counts.get(0, 0)
 
     design_issues = []
     if pl_fail > 0:
@@ -955,15 +846,15 @@ def _verify(conn, report_issues=True, integrity_check=False) -> dict:
 
     result = {
         "tables": len(REGISTRY), "size_gb": size_gb, "total_rows": total_rows,
-        "perfect": perfect, "small_gap": small_gap, "big_gap": big_gap,
-        "empty": empty, "untouched": untouched,
+        "perfect": stats["perfect"], "small_gap": stats["small_gap"],
+        "big_gap": stats["big_gap"], "empty": stats["empty"],
+        "untouched": stats["untouched"],
         "anomalies": anomalies,
         "pl_ok": pl_ok, "pl_empty": pl_empty, "pl_fail": pl_fail,
         "design_issues": design_issues,
     }
 
-    if report_issues:
-        _print_report(result)
+    _print_report(result)
 
     from database.logger import get_json_logger
     get_json_logger().write({
@@ -1126,7 +1017,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             "DELETE FROM pull_log WHERE ok=2 AND last_try < ?", (ok2_cutoff,))
         conn.commit()
         for table, dates in by_table.items():
-            entry = next((e for e in REGISTRY if e["table"] == table), None)
+            entry = _find_entry(table=table)
             if not entry:
                 logger.warning(f"[daily] {table} 不在 REGISTRY，跳过复验")
                 continue
@@ -1147,7 +1038,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
     if failed:
         logger.info(f"[daily] 发现 {len(failed)} 条失败记录，自动修复…")
         for (table, date_val, retry_count) in failed:
-            entry = next((e for e in REGISTRY if e["table"] == table), None)
+            entry = _find_entry(table=table)
             if not entry:
                 logger.warning(f"[daily] {table} 不在 REGISTRY，跳过")
                 continue
@@ -1178,7 +1069,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
 def _cmd_refresh(conn, dc, args, run_id, t_start):
     """--refresh: 单表单日修复."""
     api, date_val = args.refresh
-    entry = next((e for e in REGISTRY if e["api"] == api), None)
+    entry = _find_entry(api=api)
     if not entry:
         logger.error(f"API {api} 不在 REGISTRY 中")
         sys.exit(1)
@@ -1204,7 +1095,7 @@ def _cmd_refresh(conn, dc, args, run_id, t_start):
     _write_run_end(conn, run_id, t_start)
 
 
-def _cmd_dry_run(conn, args, run_id, t_start):
+def _cmd_dry_run(args, run_id, t_start):
     """--dry-run: 仅打印策略矩阵，无副作用."""
     entries = REGISTRY
     if args.api:
@@ -1270,31 +1161,22 @@ def main():
     t_start = time.time()
 
     if args.verify:
-        command = "verify"
-        _log_run_start(jlog, run_id, command, args)
-        _cmd_verify(conn, run_id, t_start)
+        command, runner = "verify", lambda: _cmd_verify(conn, run_id, t_start)
     elif args.cleanup:
-        command = "cleanup"
-        _log_run_start(jlog, run_id, command, args)
-        _cmd_cleanup(conn, dc, args, run_id, t_start)
+        command, runner = "cleanup", lambda: _cmd_cleanup(conn, dc, args, run_id, t_start)
     elif args.dry_run:
-        command = "dry_run"
-        _log_run_start(jlog, run_id, command, args)
-        _cmd_dry_run(conn, args, run_id, t_start)
+        command, runner = "dry_run", lambda: _cmd_dry_run(args, run_id, t_start)
     elif args.refresh:
-        command = "refresh"
-        _log_run_start(jlog, run_id, command, args)
-        _cmd_refresh(conn, dc, args, run_id, t_start)
+        command, runner = "refresh", lambda: _cmd_refresh(conn, dc, args, run_id, t_start)
     elif args.daily:
-        command = "daily"
-        _log_run_start(jlog, run_id, command, args)
-        _run_infrastructure(config, conn, dc)
-        _cmd_daily(conn, dc, args, config, run_id, t_start)
+        command, runner = "daily", lambda: _cmd_daily(conn, dc, args, config, run_id, t_start)
     else:
-        command = "backfill"
-        _log_run_start(jlog, run_id, command, args)
+        command, runner = "backfill", lambda: _cmd_backfill(conn, dc, args, run_id, t_start)
+
+    _log_run_start(jlog, run_id, command, args)
+    if command in ("daily", "backfill"):
         _run_infrastructure(config, conn, dc)
-        _cmd_backfill(conn, dc, args, run_id, t_start)
+    runner()
 
 if __name__ == "__main__":
     main()

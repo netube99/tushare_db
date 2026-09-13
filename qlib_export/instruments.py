@@ -1,6 +1,7 @@
 """品种清单管理 — InstrumentSync + IndexConstituentSync + get_instruments_for_table."""
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 from qlib_export.calendar import format_date as _format_date_raw
@@ -9,9 +10,23 @@ from qlib_export.specs import INSTRUMENT_SOURCES, VIRTUAL_INSTRUMENTS, _table_ex
 
 def format_date(raw: str) -> str:
     """YYYYMMDD → YYYY-MM-DD，空/过短返回 ""."""
-    if not raw or len(raw) < 8:
-        return ""
-    return _format_date_raw(raw)
+    return _format_date_raw(raw) if raw and len(raw) >= 8 else ""
+
+
+def _days_between(d1: str, d2: str) -> int:
+    """计算两个 YYYYMMDD 之间的天数."""
+    return (date(int(d2[:4]), int(d2[4:6]), int(d2[6:8]))
+            - date(int(d1[:4]), int(d1[4:6]), int(d1[6:8]))).days
+
+
+def _write_instruments_tsv(path: Path, entries: list[tuple[str, str, str]],
+                           sort: bool = False) -> None:
+    """写 instrument TSV（start/end 缺省补 1990-01-01 / 2099-12-31）."""
+    if sort:
+        entries = sorted(entries, key=lambda x: (x[0], x[1]))
+    lines = [f"{inst}\t{start or '1990-01-01'}\t{end or '2099-12-31'}"
+             for inst, start, end in entries]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def ts_code_to_qlib_instrument(ts_code: str, inst_type: str = "stock") -> str:
@@ -128,19 +143,9 @@ class InstrumentSync:
                 end = format_date(row[2])
                 entries.append((inst, start, end))
 
-        self._write(entries)
-
-    def _write(self, entries: list[tuple[str, str, str]]) -> None:
         path = self.output_dir / "instruments" / "all.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
-        lines = []
-        for inst, start, end in entries:
-            if not end:
-                end = "2099-12-31"
-            if not start:
-                start = "1990-01-01"
-            lines.append(f"{inst}\t{start}\t{end}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_instruments_tsv(path, entries)
 
 
 class IndexConstituentSync:
@@ -200,7 +205,7 @@ class IndexConstituentSync:
         prev = dates[0]
 
         for d in dates[1:]:
-            if self._days_between(prev, d) > 40:
+            if _days_between(prev, d) > 40:
                 end = format_date(prev)
                 if end == format_date(max_date):
                     end = "2099-12-31"
@@ -214,29 +219,13 @@ class IndexConstituentSync:
         periods.append((inst, format_date(period_start), end))
         return periods
 
-    @staticmethod
-    def _days_between(d1: str, d2: str) -> int:
-        """计算两个 YYYYMMDD 之间的天数."""
-        from datetime import datetime
-        dt1 = datetime(int(d1[:4]), int(d1[4:6]), int(d1[6:8]))
-        dt2 = datetime(int(d2[:4]), int(d2[4:6]), int(d2[6:8]))
-        return (dt2 - dt1).days
-
     def _write_file(
         self, name: str, entries: list[tuple[str, str, str]]
     ) -> None:
         """写单个指数成分股 TSV 文件."""
-        sorted_entries = sorted(entries, key=lambda x: (x[0], x[1]))
-        lines = []
-        for inst, start, end in sorted_entries:
-            if not end:
-                end = "2099-12-31"
-            if not start:
-                start = "1990-01-01"
-            lines.append(f"{inst}\t{start}\t{end}")
-
-        path = self.instruments_dir / f"{name}.txt"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_instruments_tsv(
+            self.instruments_dir / f"{name}.txt", entries, sort=True
+        )
 
 
 def get_instruments_for_table(conn: sqlite3.Connection, table_cfg: dict) -> list[str]:

@@ -1,6 +1,7 @@
 """数据库核心工具 — 连接、upsert、配置加载."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import date, datetime
@@ -81,9 +82,7 @@ def get_conn(db_path: str | None = None) -> sqlite3.Connection:
     if db_path is None:
         db_path = os.path.join(PROJECT_ROOT, "data", "market.db")
     if db_path != ":memory:":
-        dir_path = os.path.dirname(os.path.abspath(db_path))
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -121,8 +120,6 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
     replace_all: 无主键表默认整表替换（once 快照表适用）；分区替换场景
     （partition_key，如 pledge_detail）置 False，仅 INSERT 不删除。
     """
-    if df.empty:
-        return 0
     df = df.dropna(how="all")
     if df.empty:
         return 0
@@ -140,13 +137,12 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
 
     # 主键列必须全部出现，否则 REPLACE 失效，行会以 NULL pk 无限堆积
     missing_pk = pk_cols - set(df.columns)
-    if pk_cols and missing_pk:
+    if missing_pk:
         raise ValueError(f"upsert_df: 表 {table} 主键列 {sorted(missing_pk)} 不在 DataFrame 中")
 
     # 丢弃主键列为 NaN 的脏行（NULL pk 不触发 REPLACE，会堆积重复行）
-    nan_pk_cols = list(pk_cols & set(df.columns))
-    if drop_null_pk and nan_pk_cols:
-        df = df.dropna(subset=nan_pk_cols)
+    if drop_null_pk and pk_cols:
+        df = df.dropna(subset=list(pk_cols))
         if df.empty:
             return 0
 
@@ -160,12 +156,9 @@ def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
     # extension dtypes 等）逐值归一化，避免 np.int64/Timestamp/NaT/pd.NA 绑定失败
     if all(isinstance(dt, np.dtype) and dt.kind in "ifbu"
            or isinstance(dt, pd.StringDtype) for dt in df.dtypes):
-        rows = [tuple(row) for row in df.itertuples(index=False)]
+        rows = list(df.itertuples(index=False))
     else:
-        rows = [
-            tuple(_bind_value(v) for v in row)
-            for row in df.itertuples(index=False)
-        ]
+        rows = [tuple(_bind_value(v) for v in row) for row in df.itertuples(index=False)]
     try:
         # 无 pk 表：整表替换（仅剩 once 策略快照表适用）；与 INSERT 同事务，失败整体回滚
         if not pk_cols and replace_all:
@@ -206,7 +199,6 @@ def load_api_registry() -> list[dict]:
     global _registry_cache
     if _registry_cache is not None:
         return _registry_cache
-    import json
     path = os.path.join(PROJECT_ROOT, "api_index.json")
     with open(path) as f:
         _registry_cache = json.load(f)

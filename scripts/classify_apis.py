@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,80 +23,48 @@ from database.utils import atomic_write_text, load_config
 INDEX_FILE = PROJECT_ROOT / "api_index.json"
 
 
+def _hour_day(raw) -> bool:
+    s = str(raw or "")
+    return "小时" in s or "天" in s
+
+
 def _parse_rate(raw) -> int | None:
     """从 rate_limit 提取次/分钟数，非分钟单位返回 None."""
-    if raw is None:
+    if raw is None or _hour_day(raw):
         return None
-    import re
-    s = str(raw)
-    if '小时' in s or '天' in s:
-        return None  # 非分钟级，不适用于建库
-    m = re.search(r'(\d+)', s)
+    m = re.search(r"(\d+)", str(raw))
     return int(m.group(1)) if m else None
+
+
+def _result(api: dict, rule: int, label: str, usable: bool,
+            rate: int | None, interval: int | None, note: str | None) -> dict:
+    return {**api, "_rule": rule, "_rule_label": label, "_usable": usable,
+            "_effective_rate": rate, "_recommended_interval_ms": interval,
+            "_note": note}
 
 
 def classify(api: dict, points: int, default_rate_limit: int) -> dict:
     """对单个 API 分类，返回带 _ 前缀内部字段的字典."""
     min_points = api.get("min_points")
     rate_limit = _parse_rate(api.get("rate_limit"))
-    is_premium = api.get("is_premium", False)
 
-    # 规则 6: 专属付费
-    if is_premium:
-        return {
-            **api,
-            "_rule": 6,
-            "_rule_label": "专属付费",
-            "_usable": False,
-            "_effective_rate": None,
-            "_recommended_interval_ms": None,
-            "_note": "需单独付费解锁",
-        }
+    if api.get("is_premium", False):
+        return _result(api, 6, "专属付费", False, None, None, "需单独付费解锁")
 
-    # 规则 1 / 2: 积分满足
     if min_points is None or min_points <= points:
-        # 小时/天级限流不适合批量建库
         raw_limit = str(api.get("rate_limit") or "")
-        if "小时" in raw_limit or "天" in raw_limit:
-            return {
-                **api,
-                "_rule": 2,
-                "_rule_label": "小时/天级限流",
-                "_usable": False,
-                "_effective_rate": None,
-                "_recommended_interval_ms": None,
-                "_note": f"频率限制 {raw_limit}，不适合批量建库",
-            }
+        if _hour_day(raw_limit):
+            return _result(api, 2, "小时/天级限流", False, None, None,
+                           f"频率限制 {raw_limit}，不适合批量建库")
         eff_rate = rate_limit if rate_limit else default_rate_limit
-        interval = int(60000 / eff_rate / 0.8)  # 0.8 安全冗余，内置处理
+        interval = int(60000 / eff_rate / 0.8)
         if rate_limit and rate_limit < default_rate_limit:
-            _rule = 2
-            _label = f"{eff_rate}/min"
-            _note = f"频率限制{eff_rate}/min（低于标准{default_rate_limit}）"
-        else:
-            _rule = 1
-            _label = f"{eff_rate}/min"
-            _note = None
-        return {
-            **api,
-            "_rule": _rule,
-            "_rule_label": _label,
-            "_usable": True,
-            "_effective_rate": eff_rate,
-            "_recommended_interval_ms": interval,
-            "_note": _note,
-        }
+            return _result(api, 2, f"{eff_rate}/min", True, eff_rate, interval,
+                           f"频率限制{eff_rate}/min（低于标准{default_rate_limit}）")
+        return _result(api, 1, f"{eff_rate}/min", True, eff_rate, interval, None)
 
-    # min_points > points — 积分不足
-    return {
-        **api,
-        "_rule": 3,
-        "_rule_label": "积分不足",
-        "_usable": True,
-        "_effective_rate": None,
-        "_recommended_interval_ms": None,
-        "_note": f"min_points={min_points}>{points}，积分不足，频率受限",
-    }
+    return _result(api, 3, "积分不足", True, None, None,
+                   f"min_points={min_points}>{points}，积分不足，频率受限")
 
 
 def main():
@@ -111,31 +81,23 @@ def main():
     classified = [classify(api, points, rate_limit) for api in index]
     exclude = set(config.get("exclude_apis", []))
 
-    counts: dict[int, int] = {}
+    counts = Counter(api["_rule"] for api in classified)
+
     for api in classified:
-        _rule = api["_rule"]
-        counts[_rule] = counts.get(_rule, 0) + 1
-
         proj = api.setdefault("_project", {})
-
-        # 排除条件（对应原 main() 跳过逻辑）
-        if api.get("unexpected_error"):
-            proj.pop("classification", None)
-            continue
-        if not api["_usable"] or api["_rule"] == 3 or api["api_name"] in exclude:
-            # 保留手动标记的 overdraft classification
-            existing = proj.get("classification", {})
-            if not existing.get("overdraft"):
+        always_drop = (
+            api.get("unexpected_error")
+            or any(p["name"] == "ts_code" and p.get("required")
+                   for p in api.get("input_params", []))
+        )
+        rule_blocked = (not api["_usable"] or api["_rule"] == 3
+                        or api["api_name"] in exclude)
+        if always_drop or rule_blocked:
+            if always_drop or not proj.get("classification", {}).get("overdraft"):
                 proj.pop("classification", None)
             continue
-        # ts_code 必填 → 无法批量拉全市场，自动排除
-        if any(p["name"] == "ts_code" and p.get("required")
-               for p in api.get("input_params", [])):
-            proj.pop("classification", None)
-            continue
 
-        # 写入 classification
-        proj["classification"] = {
+        clf = {
             "rule": api["_rule"],
             "rule_label": api["_rule_label"],
             "usable": api["_usable"],
@@ -143,13 +105,11 @@ def main():
             "recommended_interval_ms": api["_recommended_interval_ms"],
         }
         if api.get("_note"):
-            proj["classification"]["note"] = api["_note"]
+            clf["note"] = api["_note"]
+        proj["classification"] = clf
 
-    # 计数已写入 classification 的 API
-    r1 = sum(1 for a in classified
-             if a.get("_project", {}).get("classification", {}).get("rule") == 1)
-    r2 = sum(1 for a in classified
-             if a.get("_project", {}).get("classification", {}).get("rule") == 2)
+    written = [a.get("_project", {}).get("classification", {}).get("rule")
+               for a in classified]
 
     # 清理 classify() 产出的临时 _ 前缀字段（保留 _project）
     for api in classified:
@@ -185,7 +145,7 @@ def main():
         if n:
             print(f"  {label:30s}: {n}")
 
-    print(f"\n写入 classification: 规则1={r1} | 规则2={r2}")
+    print(f"\n写入 classification: 规则1={written.count(1)} | 规则2={written.count(2)}")
     print(f"输出: {INDEX_FILE}  (_project.classification)")
 
 
