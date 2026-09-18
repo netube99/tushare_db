@@ -20,6 +20,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from database import engine
 from database.utils import get_conn, beijing_now
 from qlib_export import (
     build_field_map,
@@ -33,7 +34,7 @@ from qlib_export import (
 # 路径常量
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "market.db"
+DB_PATH = Path(engine.DEFAULT_DB_PATH)
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "qlib_bin" / "cn_data"
 
 
@@ -177,7 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=None,
                        help=f"bin 输出目录（默认: {DEFAULT_OUTPUT_DIR}）")
     parser.add_argument("--db", type=str, default=None,
-                       help=f"market.db 路径（默认: {DB_PATH}）")
+                       help=f"market.duckdb 路径（默认: {DB_PATH}）")
     return parser.parse_args()
 
 
@@ -190,77 +191,84 @@ def main() -> None:
 
     mode = ('daily' if args.daily else 'reset' if args.reset
             else 'dry-run' if args.dry_run else 'fields' if args.fields else 'full')
-    print(f"Qlib Converter — market.db → {output_dir}")
+    print(f"Qlib Converter — market.duckdb → {output_dir}")
     print(f"模式: {mode}")
-
-    conn = get_conn(db_path)
-    init_sync_log(conn)
 
     from database.logger import get_json_logger
     logger = get_json_logger()
     logger.write({"level": "INFO", "module": "convert_to_qlib", "event": "run_start",
                   "mode": mode, "output_dir": str(output_dir)})
 
-    try:
-        print("构建字段映射...")
-        conversion_tables = build_field_map(conn)
+    # 转换器写 bin_sync_log，与 maintain 同属写者，必须串行
+    with engine.db_lock(db_path, exclusive=True) as acquired:
+        if not acquired:
+            print("数据库被其他进程占用（DuckDB 单写者），稍后重试")
+            return
+        conn = get_conn(db_path)
+        init_sync_log(conn)
+        try:
+            _run(conn, args, output_dir, db_path)
+        finally:
+            elapsed = time.time() - t_start
+            logger.write({"level": "INFO", "module": "convert_to_qlib", "event": "run_end",
+                          "elapsed_sec": round(elapsed, 1)})
+            conn.close()
 
-        if args.table:
-            table_filter = {t.strip() for t in args.table.split(",")}
-            conversion_tables = [t for t in conversion_tables
-                                 if t["source_table"] in table_filter]
-            print(f"  --table 过滤: {table_filter}")
 
-        total_fields = sum(len(t["fields"]) for t in conversion_tables)
-        print(f"  共 {len(conversion_tables)} 张表, {total_fields} 个字段")
-        if args.since:
-            print(f"  日期过滤: >= {args.since}")
+def _run(conn, args, output_dir, db_path) -> None:
+    print("构建字段映射...")
+    conversion_tables = build_field_map(conn)
 
-        if args.reset and not args.dry_run:
-            print("清除所有 bin 文件和同步状态...")
-            if output_dir.exists():
-                import shutil
-                shutil.rmtree(output_dir)
-            clear_all_sync_log(conn)
+    if args.table:
+        table_filter = {t.strip() for t in args.table.split(",")}
+        conversion_tables = [t for t in conversion_tables
+                             if t["source_table"] in table_filter]
+        print(f"  --table 过滤: {table_filter}")
 
-        print("[1/3] 初始化日历和品种清单...")
-        calendar = CalendarSync(output_dir)
-        old_calendar = calendar.load_old_calendar() if args.daily else None
-        if args.daily:
-            # 日历由 daily_sync 全量重建并写盘（先 load 旧日历供比对）
-            calendar.load()
-        elif args.dry_run:
-            # dry-run 只读：优先复用已有日历文件，缺失时才从 DB 构建
-            calendar.load()
-            if not calendar.calendar:
-                calendar.full_init(conn)
-        else:
+    total_fields = sum(len(t["fields"]) for t in conversion_tables)
+    print(f"  共 {len(conversion_tables)} 张表, {total_fields} 个字段")
+    if args.since:
+        print(f"  日期过滤: >= {args.since}")
+
+    if args.reset and not args.dry_run:
+        print("清除所有 bin 文件和同步状态...")
+        if output_dir.exists():
+            import shutil
+            shutil.rmtree(output_dir)
+        clear_all_sync_log(conn)
+
+    print("[1/3] 初始化日历和品种清单...")
+    calendar = CalendarSync(output_dir)
+    old_calendar = calendar.load_old_calendar() if args.daily else None
+    if args.daily:
+        # 日历由 daily_sync 全量重建并写盘（先 load 旧日历供比对）
+        calendar.load()
+    elif args.dry_run:
+        # dry-run 只读：优先复用已有日历文件，缺失时才从 DB 构建
+        calendar.load()
+        if not calendar.calendar:
             calendar.full_init(conn)
-        if calendar.calendar:
-            print(f"  日历: {calendar.n_days} 天 ({calendar.calendar_range[0]} ~ {calendar.calendar_range[1]})")
+    else:
+        calendar.full_init(conn)
+    if calendar.calendar:
+        print(f"  日历: {calendar.n_days} 天 ({calendar.calendar_range[0]} ~ {calendar.calendar_range[1]})")
 
-        inst_sync = InstrumentSync(output_dir)
+    inst_sync = InstrumentSync(output_dir)
 
-        feature_sync = FeatureSync(output_dir, calendar, conn, since=args.since)
+    feature_sync = FeatureSync(output_dir, calendar, conn, since=args.since)
 
-        if args.dry_run:
-            _cmd_dry_run(conn, conversion_tables, calendar, output_dir)
-        elif args.fields:
-            field_names = [f.strip() for f in args.fields.split(",")]
-            print(f"重建字段: {field_names}")
-            rebuilder = FieldRebuilder(output_dir, conn, feature_sync)
-            rebuilder.rebuild_fields(conversion_tables, field_names)
-        elif args.daily:
-            _cmd_daily(conn, conversion_tables, calendar, inst_sync, feature_sync, output_dir,
-                       old_calendar=old_calendar)
-        else:
-            _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output_dir)
-
-    finally:
-        elapsed = time.time() - t_start
-        logger.write({"level": "INFO", "module": "convert_to_qlib", "event": "run_end",
-                      "elapsed_sec": round(elapsed, 1)})
-        conn.close()
+    if args.dry_run:
+        _cmd_dry_run(conn, conversion_tables, calendar, output_dir)
+    elif args.fields:
+        field_names = [f.strip() for f in args.fields.split(",")]
+        print(f"重建字段: {field_names}")
+        rebuilder = FieldRebuilder(output_dir, conn, feature_sync)
+        rebuilder.rebuild_fields(conversion_tables, field_names)
+    elif args.daily:
+        _cmd_daily(conn, conversion_tables, calendar, inst_sync, feature_sync, output_dir,
+                   old_calendar=old_calendar)
+    else:
+        _cmd_full(conn, conversion_tables, calendar, inst_sync, feature_sync, output_dir)
 
 
 def _cmd_dry_run(conn, conversion_tables, calendar, output_dir):
@@ -279,8 +287,11 @@ def _cmd_dry_run(conn, conversion_tables, calendar, output_dir):
         fields = table_cfg["fields"]
         field_names = [f["bin_name"] for f in fields]
 
+        from qlib_export.sync_log import load_synced_fields
+        synced_map = load_synced_fields(conn, source_table)
+        desired = set(field_names)
         synced = sum(1 for inst in instruments
-                    if is_synced(conn, inst, source_table, field_names))
+                     if desired.issubset(synced_map.get(inst, set())))
         pending = len(instruments) - synced
 
         total_insts += len(instruments)

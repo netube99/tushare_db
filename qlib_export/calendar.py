@@ -1,8 +1,9 @@
 """交易日历管理 — CalendarSync + date_to_cal_index."""
 
 import bisect
-import sqlite3
 from pathlib import Path
+
+from database.engine import Connection
 
 
 def format_date(raw: str) -> str:
@@ -46,7 +47,7 @@ class CalendarSync:
             return None
         return path.read_text(encoding="utf-8").strip().splitlines()
 
-    def full_init(self, conn: sqlite3.Connection) -> None:
+    def full_init(self, conn: Connection) -> None:
         """从 trade_cal 全量构建日历."""
         rows = conn.execute(
             "SELECT cal_date FROM trade_cal WHERE exchange='SSE' AND is_open=1 ORDER BY cal_date"

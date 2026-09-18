@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -11,6 +10,7 @@ import pandas as pd
 import pytest
 import yaml
 
+from database.engine import Connection, connect
 from scripts import refresh_national_team_daily as nt
 from scripts import refresh_pension_daily as pen
 
@@ -21,25 +21,29 @@ NT_HOLDER = "中央汇金投资有限责任公司"
 PENSION_HOLDER = "基本养老保险基金八零二组合"
 
 
-@pytest.fixture()
-def conn():
-    c = sqlite3.connect(":memory:")
+def init_source_tables(c: Connection) -> None:
     c.execute(
         """CREATE TABLE top10_floatholders (
-            ts_code TEXT, ann_date TEXT, end_date TEXT, holder_name TEXT,
-            hold_amount REAL, hold_ratio REAL, hold_float_ratio REAL,
-            hold_change REAL, holder_type TEXT)"""
+            ts_code VARCHAR, ann_date VARCHAR, end_date VARCHAR, holder_name VARCHAR,
+            hold_amount DOUBLE, hold_ratio DOUBLE, hold_float_ratio DOUBLE,
+            hold_change DOUBLE, holder_type VARCHAR)"""
     )
     c.execute(
         """CREATE TABLE trade_cal (
-            exchange TEXT NOT NULL, cal_date TEXT NOT NULL, is_open INTEGER NOT NULL,
-            pretrade_date TEXT, PRIMARY KEY (exchange, cal_date))"""
+            exchange VARCHAR NOT NULL, cal_date VARCHAR NOT NULL, is_open BIGINT NOT NULL,
+            pretrade_date VARCHAR, PRIMARY KEY (exchange, cal_date))"""
     )
+
+
+@pytest.fixture()
+def conn():
+    c = connect(":memory:")
+    init_source_tables(c)
     yield c
     c.close()
 
 
-def add_cal(conn: sqlite3.Connection, start: date, end: date) -> None:
+def add_cal(conn: Connection, start: date, end: date) -> None:
     d = start
     rows = []
     while d <= end:
@@ -49,7 +53,7 @@ def add_cal(conn: sqlite3.Connection, start: date, end: date) -> None:
 
 
 def add_holder(
-    conn: sqlite3.Connection,
+    conn: Connection,
     ts_code: str,
     ann_date: str,
     holder_name: str,
@@ -108,6 +112,30 @@ def test_pension_carry_stops_at_next_ann(conn):
     assert out.loc[out["trade_date"] == "20240105", "pen_cnt"].iloc[0] == 1
     assert out.loc[out["trade_date"] == "20240105", "pen_age"].iloc[0] == 0
     assert out["trade_date"].max() == "20240110"
+
+
+def test_pension_age_is_natural_days_across_month(conn):
+    add_cal(conn, date(2024, 1, 25), date(2024, 2, 10))
+    add_holder(conn, "000001.SZ", "20240128", PENSION_HOLDER, holder_type="基本养老保险基金")
+    out = pen.build(conn)
+    ages = dict(zip(out["trade_date"], out["pen_age"]))
+    assert ages["20240128"] == 0
+    assert ages["20240201"] == 4   # YYYYMMDD 整数差会得 20240201-20240128=73
+    assert ages["20240205"] == 8
+    assert max(ages.values()) < 400
+
+
+def test_pension_same_ann_keeps_latest_report_period_only(conn):
+    add_cal(conn, date(2024, 1, 1), date(2024, 3, 15))
+    add_holder(conn, "000089.SZ", "20240210", PENSION_HOLDER,
+               holder_type="基本养老保险基金", end_date="20231231")
+    add_holder(conn, "000089.SZ", "20240210", "基本养老保险基金一零零三组合",
+               holder_type="基本养老保险基金", end_date="20240331")
+    out = pen.build(conn)
+    row = out.loc[out["trade_date"] == "20240210"].iloc[0]
+    assert row["pen_cnt"] == 1
+    assert row["pen_ratio_sum"] == pytest.approx(1.5)
+    assert row["pen_float_ratio_sum"] == pytest.approx(1.5)
 
 
 def test_pension_empty_source_tables(conn):
@@ -175,29 +203,38 @@ def test_nt_last_event_carries_until_stale(conn):
     assert out["nt_age"].max() == 9
 
 
+def test_nt_age_is_natural_days_across_month(conn):
+    add_cal(conn, date(2024, 1, 25), date(2024, 2, 10))
+    add_holder(conn, "000001.SZ", "20240128", NT_HOLDER)
+    out = nt.build(conn, stale_days=400)
+    ages = dict(zip(out["trade_date"], out["nt_age"]))
+    assert ages["20240128"] == 0
+    assert ages["20240201"] == 4   # YYYYMMDD 整数差会得 20240201-20240128=73
+    assert ages["20240205"] == 8
+
+
 # ── main(): 幂等 / 原子性 / 缺表报错 ──
 
 
 @pytest.fixture()
-def seeded_db(tmp_path, conn):
-    add_cal(conn, date(2024, 1, 1), date(2024, 2, 1))
-    add_holder(conn, "000001.SZ", "20240110", NT_HOLDER)
-    add_holder(conn, "000002.SZ", "20240110", PENSION_HOLDER, holder_type="基本养老保险基金")
-    path = tmp_path / "market.db"
-    conn.commit()
-    backup = sqlite3.connect(str(path))
-    conn.backup(backup)
-    backup.close()
+def seeded_db(tmp_path):
+    path = tmp_path / "market.duckdb"
+    c = connect(str(path))
+    init_source_tables(c)
+    add_cal(c, date(2024, 1, 1), date(2024, 2, 1))
+    add_holder(c, "000001.SZ", "20240110", NT_HOLDER)
+    add_holder(c, "000002.SZ", "20240110", PENSION_HOLDER, holder_type="基本养老保险基金")
+    c.close()
     return path
 
 
 def test_nt_main_rerun_idempotent(seeded_db, monkeypatch):
     run_main(nt, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     first = c.execute("SELECT COUNT(*) FROM national_team_daily").fetchone()[0]
     c.close()
     run_main(nt, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     second = c.execute("SELECT COUNT(*) FROM national_team_daily").fetchone()[0]
     c.close()
     assert first == second > 0
@@ -205,11 +242,11 @@ def test_nt_main_rerun_idempotent(seeded_db, monkeypatch):
 
 def test_pension_main_rerun_idempotent(seeded_db, monkeypatch):
     run_main(pen, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     first = c.execute("SELECT COUNT(*) FROM pension_float_daily").fetchone()[0]
     c.close()
     run_main(pen, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     second = c.execute("SELECT COUNT(*) FROM pension_float_daily").fetchone()[0]
     c.close()
     assert first == second > 0
@@ -217,34 +254,34 @@ def test_pension_main_rerun_idempotent(seeded_db, monkeypatch):
 
 def test_nt_main_preserves_old_table_on_write_failure(seeded_db, monkeypatch):
     run_main(nt, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     expected = c.execute("SELECT COUNT(*) FROM national_team_daily").fetchone()[0]
     c.close()
 
-    def boom(self, *args, **kwargs):
+    def boom(*args, **kwargs):
         raise RuntimeError("simulated write failure")
 
-    monkeypatch.setattr(pd.DataFrame, "to_sql", boom)
+    monkeypatch.setattr(nt, "atomic_replace", boom)
     with pytest.raises(RuntimeError):
         run_main(nt, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     assert c.execute("SELECT COUNT(*) FROM national_team_daily").fetchone()[0] == expected
     c.close()
 
 
 def test_pension_main_preserves_old_table_on_write_failure(seeded_db, monkeypatch):
     run_main(pen, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     expected = c.execute("SELECT COUNT(*) FROM pension_float_daily").fetchone()[0]
     c.close()
 
-    def boom(self, *args, **kwargs):
+    def boom(*args, **kwargs):
         raise RuntimeError("simulated write failure")
 
-    monkeypatch.setattr(pd.DataFrame, "to_sql", boom)
+    monkeypatch.setattr(pen, "atomic_replace", boom)
     with pytest.raises(RuntimeError):
         run_main(pen, seeded_db, monkeypatch)
-    c = sqlite3.connect(seeded_db)
+    c = connect(str(seeded_db))
     assert c.execute("SELECT COUNT(*) FROM pension_float_daily").fetchone()[0] == expected
     c.close()
 
@@ -270,6 +307,9 @@ CONSUMED_KEYS = {
     "backfill_since",
     "pull_after",
     "exclude_apis",
+    "duckdb_threads",
+    "duckdb_memory_limit",
+    "duckdb_checkpoint_threshold",
 }
 
 
@@ -299,3 +339,9 @@ def test_template_exclude_apis_strings(template_cfg):
 
 def test_template_keeps_top10_floatholders(template_cfg):
     assert "top10_floatholders" not in template_cfg["exclude_apis"]
+
+
+def test_pledge_detail_not_excluded_in_live_config():
+    from database.utils import load_config
+    config = load_config()
+    assert "pledge_detail" not in set(config.get("exclude_apis", []))

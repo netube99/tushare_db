@@ -20,6 +20,16 @@ tushare_interval_r2_ms: 2000
 # HTTP 代理：null=裸连，'__use_system__'=走系统代理，或填 'http://host:port'
 # tushare_proxy: null
 
+# ── DuckDB 运行时 ──
+# 查询/写入线程数
+duckdb_threads: 4
+
+# 内存上限（大库迁移/建库时避免占用全部内存）
+duckdb_memory_limit: 16GB
+
+# WAL 落盘阈值，达到后自动 CHECKPOINT
+duckdb_checkpoint_threshold: 1GB
+
 # ── 数据拉取 ──
 # 数据库最大历史日期（YYYYMMDD）
 # 本项目建库的顺序是从最新交易日向旧历史拉取

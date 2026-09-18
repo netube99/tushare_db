@@ -1,14 +1,14 @@
 """增量同步引擎 — IncrementalSync + FieldRebuilder."""
 
 import json
-import sqlite3
 from pathlib import Path
 
+from database.engine import Connection
 from qlib_export.specs import _collect_tushare_cols
 from qlib_export.sync_log import upsert_sync_log, get_sync_records
-from qlib_export.binio import write_bin, append_bin
+from qlib_export.binio import CorruptBinError, write_bin, append_bin
 from qlib_export.instruments import (
-    get_instruments_for_table, InstrumentSync,
+    get_instruments_for_table, InstrumentSync, qlib_to_ts_code,
 )
 from qlib_export.calendar import CalendarSync
 from qlib_export.features import FeatureSync
@@ -18,7 +18,7 @@ class IncrementalSync:
     """每日增量追加引擎."""
 
     def __init__(self, output_dir: Path, calendar: CalendarSync,
-                 conn: sqlite3.Connection, feature_sync: FeatureSync):
+                 conn: Connection, feature_sync: FeatureSync):
         self.output_dir = output_dir
         self.calendar = calendar
         self.conn = conn
@@ -62,11 +62,12 @@ class IncrementalSync:
                 if not quiet and (i + 1) % 100 == 0:
                     print(f"  [{source_table}] scan {i+1}/{len(all_insts)}")
 
+            current_first_map = self._load_min_dates(table_cfg)
             for j, record in enumerate(records):
                 if not quiet and (j + 1) % 100 == 0:
                     print(f"  [{source_table}] sync {j+1}/{len(records)}")
                 self._sync_record(record, table_cfg, desired_field_names,
-                                  stats, quiet)
+                                  stats, quiet, current_first_map)
 
         from database.logger import get_json_logger
         get_json_logger().write({
@@ -79,9 +80,23 @@ class IncrementalSync:
 
         return stats
 
+    def _load_min_dates(self, table_cfg: dict) -> dict[str, str]:
+        """一次性取该表各 instrument 的 MIN(date_col)，替代逐条点查."""
+        if table_cfg.get("virtual_inst"):
+            inst = table_cfg["virtual_inst"]
+            bound = self.feature_sync._get_date_bound(inst, table_cfg, "MIN")
+            return {inst: bound}
+        inst_col, date_col = table_cfg["inst_col"], table_cfg["date_col"]
+        inst_type = table_cfg["inst_type"]
+        rows = self.conn.execute(
+            f'SELECT "{inst_col}", MIN("{date_col}") FROM "{table_cfg["source_table"]}" '
+            f'GROUP BY "{inst_col}"').fetchall()
+        return {qlib_to_ts_code(r[0], inst_type): (str(r[1]) if r[1] else "")
+                for r in rows if r[0]}
+
     def _sync_record(self, record: dict, table_cfg: dict,
                      desired_field_names: list[str], stats: dict,
-                     quiet: bool) -> None:
+                     quiet: bool, current_first_map: dict[str, str]) -> None:
         """处理单条已同步记录: 字段回填 / 缺口检测 / 增量追加."""
         source_table = table_cfg["source_table"]
         inst = record["instrument"]
@@ -100,7 +115,8 @@ class IncrementalSync:
                             fields=list(synced_fields))
 
         reason = self._backfill_reason(record, inst, table_cfg,
-                                       first_date, last_date)
+                                       first_date, last_date,
+                                       current_first_map.get(inst, ""))
         if reason:
             if not quiet:
                 print(f"  [backfill] {inst} ← {source_table}: {reason}")
@@ -121,11 +137,20 @@ class IncrementalSync:
 
         date_col = table_cfg["date_col"]
         inst_dir = self.output_dir / "features" / inst.lower()
-        for j, fdef in enumerate(table_cfg["fields"]):
-            fname = fdef["bin_name"]
-            if fname not in synced_fields:
-                continue
-            append_bin(inst_dir / f"{fname}.day.bin", arrays[j])
+        try:
+            for j, fdef in enumerate(table_cfg["fields"]):
+                fname = fdef["bin_name"]
+                if fname not in synced_fields:
+                    continue
+                append_bin(inst_dir / f"{fname}.day.bin", arrays[j])
+        except CorruptBinError as e:
+            if not quiet:
+                print(f"  [backfill] {inst} ← {source_table}: {e}")
+            self._convert_and_log(inst, table_cfg, source_table,
+                                  desired_field_names, stats,
+                                  "updated_records", "reconvert-corrupt", quiet,
+                                  cleanup=True)
+            return
 
         new_last = rows[-1][col_names.index(date_col)]
         new_row_count = (record.get("row_count") or 0) + len(rows)
@@ -137,9 +162,9 @@ class IncrementalSync:
         stats["updated_records"] += 1
 
     def _backfill_reason(self, record: dict, inst: str, table_cfg: dict,
-                         first_date: str, last_date: str) -> str | None:
+                         first_date: str, last_date: str,
+                         current_first: str) -> str | None:
         """检测需要全量重转的情形，返回原因描述或 None."""
-        current_first = self.feature_sync._get_date_bound(inst, table_cfg, "MIN")
         if first_date and current_first and current_first < first_date:
             return f"first_date {first_date} → {current_first}"
 
@@ -164,10 +189,10 @@ class IncrementalSync:
         if cleanup:
             self.feature_sync._cleanup_partial_bins(inst, field_names)
         try:
-            row_count = self.feature_sync._convert_instrument(inst, table_cfg, since="")
+            row_count, first_date, last_date = self.feature_sync._convert_instrument(
+                inst, table_cfg, since="")
             upsert_sync_log(self.conn, inst, source_table, status="done",
-                            last_date=self.feature_sync._get_date_bound(inst, table_cfg, "MAX"),
-                            first_date=self.feature_sync._get_date_bound(inst, table_cfg, "MIN"),
+                            last_date=last_date, first_date=first_date,
                             row_count=row_count, fields=field_names)
             stats[stat_key] += 1
         except Exception as e:
@@ -207,7 +232,7 @@ class IncrementalSync:
 class FieldRebuilder:
     """按字段维度重建."""
 
-    def __init__(self, output_dir: Path, conn: sqlite3.Connection,
+    def __init__(self, output_dir: Path, conn: Connection,
                  feature_sync: FeatureSync):
         self.output_dir = output_dir
         self.conn = conn

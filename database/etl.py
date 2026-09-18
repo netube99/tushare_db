@@ -1,7 +1,8 @@
 """ETL 层 — REGISTRY 驱动 API → 表映射."""
 from __future__ import annotations
 
-import sqlite3
+from database.engine import Connection
+from database.utils import beijing_now
 
 # 自动生成，勿手工编辑。运行 scripts/generate_schema.py 重新生成
 REGISTRY = [
@@ -28,6 +29,7 @@ REGISTRY = [
     {"api": "block_trade", "table": "block_trade", "date_col": "trade_date"},
     {"api": "stk_holdernumber", "table": "stk_holdernumber", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "partition_key": "ts_code"},
     {"api": "stk_holdertrade", "table": "stk_holdertrade", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "partition_key": "ts_code"},
+    {"api": "pledge_detail", "table": "pledge_detail", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "partition_key": "ts_code"},
     {"api": "top10_floatholders", "table": "top10_floatholders", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "partition_key": "ts_code"},
     {"api": "stock_hsgt", "table": "stock_hsgt", "date_col": "trade_date"},
     {"api": "stock_st", "table": "stock_st", "date_col": "trade_date"},
@@ -37,34 +39,34 @@ REGISTRY = [
     {"api": "limit_list_d", "table": "limit_list_d", "date_col": "trade_date"},
     {"api": "hm_list", "table": "hm_list"},
     {"api": "kpl_list", "table": "kpl_list", "date_col": "trade_date"},
-    {"api": "top_inst", "table": "top_inst", "date_col": "trade_date"},
+    {"api": "top_inst", "table": "top_inst", "date_col": "trade_date", "partition_key": "trade_date"},
     {"api": "kpl_concept_cons", "table": "kpl_concept_cons", "date_col": "trade_date"},
     {"api": "top_list", "table": "top_list", "date_col": "trade_date"},
     {"api": "cyq_perf", "table": "cyq_perf", "date_col": "trade_date"},
     {"api": "stk_factor_pro", "table": "stk_factor_pro", "date_col": "trade_date"},
     {"api": "bak_daily", "table": "bak_daily", "date_col": "trade_date"},
     {"api": "stk_limit", "table": "stk_limit", "date_col": "trade_date"},
-    {"api": "dividend", "table": "dividend", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "null_pk_keep": True},
+    {"api": "dividend", "table": "dividend", "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once"}, "partition_key": "ts_code", "dedupe_cols": ["ts_code", "ann_date", "div_proc"]},
     {"api": "moneyflow_hsgt", "table": "moneyflow_hsgt", "date_col": "trade_date"},
     {"api": "moneyflow", "table": "moneyflow", "date_col": "trade_date"},
     {"api": "moneyflow_dc", "table": "moneyflow_dc", "date_col": "trade_date"},
 ]
 
-def log_pull(conn: sqlite3.Connection, table: str, date_val: str, ok: int,
+def log_pull(conn: Connection, table: str, date_val: str, ok: int,
              api: str = "", rows: int = 0, strategy: str = "") -> None:
     """记录拉取结果到 pull_log，同时写 JSON 日志.
 
     ok: 0=失败需重试, 1=成功, 2=确认空不重试, 3=重试超限放弃。
-    ON CONFLICT 仅更新 ok，保留 retry_count/last_try（修复循环的重试计数）。
+    ON CONFLICT 仅更新 ok/last_try，保留 retry_count（修复循环的重试计数）。
     """
     if ok not in (0, 1, 2, 3):
         raise ValueError(f"非法 ok 值: {ok}")
     conn.execute(
         "INSERT INTO pull_log (table_name, date_val, ok, last_try) "
-        "VALUES (?, ?, ?, datetime('now', 'localtime')) "
+        "VALUES (?, ?, ?, ?) "
         "ON CONFLICT(table_name, date_val) DO UPDATE SET ok=excluded.ok, "
         "last_try=excluded.last_try",
-        (table, date_val, ok),
+        (table, date_val, ok, beijing_now().strftime("%Y-%m-%d %H:%M:%S")),
     )
     conn.commit()
     if api:

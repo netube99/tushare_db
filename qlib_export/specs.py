@@ -1,7 +1,9 @@
 """TABLE_SPECS 声明 + 字段映射生成 + instrument 来源定义."""
 
-import sqlite3
 from typing import Any
+
+from database import engine
+from database.engine import Connection
 
 # ---------------------------------------------------------------------------
 # TABLE_SPECS — 紧凑配置 + 通用推导
@@ -98,14 +100,17 @@ def _computed_fields(computed_specs: list) -> list[dict]:
     return fields
 
 
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone()
-    return row is not None
+def _table_exists(conn: Connection, table: str) -> bool:
+    return engine.table_exists(conn, table)
 
 
-def build_field_map(conn: sqlite3.Connection) -> list[dict]:
+_NUMERIC_TYPES = {
+    "DOUBLE", "FLOAT", "REAL", "BIGINT", "INTEGER", "SMALLINT", "TINYINT",
+    "HUGEINT", "UBIGINT", "UINTEGER", "DECIMAL",
+}
+
+
+def build_field_map(conn: Connection) -> list[dict]:
     """从 TABLE_SPECS + 实际 DB 结构动态生成 CONVERSION_TABLES.
 
     每张表的字段列表完全由 DB schema 决定，TABLE_SPECS 只声明命名规则和特殊策略。
@@ -127,7 +132,7 @@ def build_field_map(conn: sqlite3.Connection) -> list[dict]:
         computed_specs = spec.get("computed", [])
 
         info = conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
-        numeric_cols = {r[1] for r in info if r[2] in ("REAL", "INTEGER")}
+        numeric_cols = {r[1] for r in info if str(r[2]).split("(")[0] in _NUMERIC_TYPES}
         all_cols = {r[1] for r in info}
 
         fields: list[dict] = []

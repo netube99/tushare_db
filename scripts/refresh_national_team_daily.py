@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import sys
 
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database import engine
+from database.engine import Connection
 
 from scripts._derived_tables import (
     DEFAULT_DB,
@@ -63,30 +65,30 @@ TMP_TABLE = "national_team_daily__new"
 
 CREATE_SQL = """
 CREATE TABLE {table} (
-    ts_code    TEXT NOT NULL,
-    trade_date TEXT NOT NULL,
-    nt_state        INTEGER,
-    nt_cnt          INTEGER,
-    nt_ratio_sum    REAL,
-    nt_float_ratio_sum REAL,
-    nt_chg_sum      REAL,
-    nt_amount_sum   REAL,
-    nt_new_cnt      INTEGER,
-    nt_age          INTEGER,
-    nt_ann_date     TEXT,
+    ts_code    VARCHAR NOT NULL,
+    trade_date VARCHAR NOT NULL,
+    nt_state        BIGINT,
+    nt_cnt          BIGINT,
+    nt_ratio_sum    DOUBLE,
+    nt_float_ratio_sum DOUBLE,
+    nt_chg_sum      DOUBLE,
+    nt_amount_sum   DOUBLE,
+    nt_new_cnt      BIGINT,
+    nt_age          BIGINT,
+    nt_ann_date     VARCHAR,
     PRIMARY KEY (ts_code, trade_date)
 )
 """
 
 
-def load_events(conn: sqlite3.Connection) -> pd.DataFrame:
+def load_events(conn: Connection) -> pd.DataFrame:
     """构造事件表：在榜事件（聚合，nt_state=1）+ 退出事件（仅持股状态 1→0 时）.
 
     退出语义：国家队在榜后，某报告期披露无国家队 → 退出事件（state 1→0）。
     从未被持有的股票的披露期不是退出事件；已退出后的后续披露期也不再重复
     生成退出（state 已为 0）。重新进入 = 新的在榜事件。
     """
-    present = pd.read_sql_query(
+    present = conn.execute(
         f"""
         SELECT ts_code, ann_date,
                COUNT(DISTINCT holder_name)                                    AS nt_cnt,
@@ -100,28 +102,29 @@ def load_events(conn: sqlite3.Connection) -> pd.DataFrame:
         WHERE ann_date IS NOT NULL AND {NT_WHERE}
         GROUP BY ts_code, ann_date
         ORDER BY ts_code, ann_date
-        """,
-        conn,
-    )
-    disc = pd.read_sql_query(
+        """
+    ).df()
+    disc = conn.execute(
         """
         SELECT ts_code, end_date, MIN(ann_date) AS ann_date
         FROM top10_floatholders
         WHERE ann_date IS NOT NULL AND end_date IS NOT NULL
         GROUP BY ts_code, end_date
-        """,
-        conn,
-    )
+        """
+    ).df()
 
     present_keys = set(zip(present["ts_code"], present["ann_date"]))
+    present_anns: dict[str, set[str]] = {}
+    for ts, ann in present_keys:
+        present_anns.setdefault(ts, set()).add(ann)
 
     disc_anns: dict[str, set[str]] = {}
     for ts, ann in zip(disc["ts_code"], disc["ann_date"]):
         disc_anns.setdefault(ts, set()).add(ann)
 
     exit_rows = []
-    for ts in sorted(set(disc_anns) | {ts for ts, _ in present_keys}):
-        anns = sorted(disc_anns.get(ts, set()) | {a for t, a in present_keys if t == ts})
+    for ts in sorted(set(disc_anns) | set(present_anns)):
+        anns = sorted(disc_anns.get(ts, set()) | present_anns.get(ts, set()))
         state = 0
         for ann in anns:
             if (ts, ann) in present_keys:
@@ -147,7 +150,7 @@ def load_events(conn: sqlite3.Connection) -> pd.DataFrame:
     ).drop_duplicates(subset=["ts_code", "ann_date"], keep="first")
 
 
-def build(conn: sqlite3.Connection, stale_days: int) -> pd.DataFrame:
+def build(conn: Connection, stale_days: int) -> pd.DataFrame:
     return carry_expand(conn, load_events(conn), METRIC_COLS, "nt", stale_days, COLUMNS)
 
 
@@ -157,21 +160,22 @@ def main() -> None:
     ap.add_argument("--stale-days", type=int, default=400)
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
-    try:
-        require_tables(conn, SOURCE_TABLES)
-        out = build(conn, args.stale_days)
-        atomic_replace(conn, TMP_TABLE, FINAL_TABLE, CREATE_SQL, out, chunksize=90)
-        stocks, lo, hi = final_span(conn, FINAL_TABLE)
-        present_days = conn.execute(
-            f"SELECT COUNT(*) FROM {FINAL_TABLE} WHERE nt_state=1"
-        ).fetchone()[0]
-        print(
-            f"national_team_daily: {len(out)} 行（在榜 {present_days}）, {stocks} 只股票, "
-            f"{lo} ~ {hi} (stale_days={args.stale_days})"
-        )
-    finally:
-        conn.close()
+    with engine.db_lock(args.db, exclusive=True):
+        conn = engine.connect(args.db)
+        try:
+            require_tables(conn, SOURCE_TABLES)
+            out = build(conn, args.stale_days)
+            atomic_replace(conn, TMP_TABLE, FINAL_TABLE, CREATE_SQL, out)
+            stocks, lo, hi = final_span(conn, FINAL_TABLE)
+            present_days = conn.execute(
+                f"SELECT COUNT(*) FROM {FINAL_TABLE} WHERE nt_state=1"
+            ).fetchone()[0]
+            print(
+                f"national_team_daily: {len(out)} 行（在榜 {present_days}）, {stocks} 只股票, "
+                f"{lo} ~ {hi} (stale_days={args.stale_days})"
+            )
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

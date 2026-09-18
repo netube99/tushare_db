@@ -30,7 +30,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 INFRA_ONCE = ["stock_basic", "index_basic"]
 
 # 基础设施表：非 REGISTRY 系统表 + 常驻表，cleanup 时保留
-INFRA_TABLES = {"trade_cal", "pull_log", "stock_basic", "bin_sync_log"}
+# national_team_daily / pension_float_daily：派生物理表（scripts/refresh_*_daily.py 构建）
+INFRA_TABLES = {"trade_cal", "pull_log", "stock_basic", "bin_sync_log",
+                "national_team_daily", "pension_float_daily"}
 
 DEFAULT_BACKFILL_SINCE = "20200101"
 DEFAULT_FREQ_VALUES = ["W", "M"]
@@ -137,16 +139,16 @@ def _pull_and_store(conn, table: str, df, date_val: str,
         try:
             entry = _find_entry(table=table)
             pkey = entry.get("partition_key") if entry else None
+            # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）；
+            # DELETE 与 INSERT 在 upsert_df 内同事务，失败整体回滚
+            pre_delete = None
             if pkey and pkey in df.columns:
-                # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）；
-                # 不单独 commit，与 INSERT 同事务，失败整体回滚
-                codes = tuple(str(c) for c in df[pkey].unique())
-                placeholders = ",".join(["?"] * len(codes))
-                conn.execute(
-                    f'DELETE FROM "{table}" WHERE "{pkey}" IN ({placeholders})', codes)
+                pre_delete = (pkey, [str(c) for c in df[pkey].unique()])
             n = upsert_df(conn, table, df,
                           drop_null_pk=not bool(entry and entry.get("null_pk_keep")),
-                          replace_all=not bool(entry and entry.get("partition_key")))
+                          replace_all=not bool(entry and entry.get("partition_key")),
+                          dedupe_cols=(entry.get("dedupe_cols") if entry else None),
+                          pre_delete=pre_delete)
             logger.info(f"{log_prefix}{table}: {n} rows")
             log_pull(conn, table, date_val, 1, api=api_name, rows=n, strategy=strategy)
             return True
@@ -182,8 +184,7 @@ def _pull_once(conn, dc, entry, date_val: str, strategy: str, pfx: str,
         logger.error(f"{pfx}{name} 调用异常: {e}")
         log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
         return False
-    _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx)
-    return True
+    return _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx)
 
 
 def _done_count(conn, table: str, date_val: str,
@@ -720,17 +721,20 @@ def _verify(conn, integrity_check=False) -> dict:
     """生成质检报告，只读不写.
 
     Args:
-        integrity_check: True 时走 PRAGMA integrity_check（全扫，30-60s）；
-                         False 时跳过（建库/日更默认，43GB 上需数十秒且末尾已有覆盖度报告）。
+        integrity_check: True 时执行 CHECKPOINT 并输出 database_size；
+                         False 时跳过（建库/日更默认，末尾已有覆盖度报告）。
     """
     if integrity_check:
-        print("integrity_check 扫描中（43GB ~30-60s）…", flush=True)
+        print("database_size 读取中…", flush=True)
         try:
-            result = conn.execute("PRAGMA integrity_check").fetchone()
-            if result and result[0] != "ok":
-                print(f"  ⚠ 数据库损坏: {result[0]}")
-            else:
-                print("  ok")
+            from database import engine as _engine
+            if not getattr(conn, "read_only", False):
+                _engine.checkpoint(conn)
+                print("  checkpoint ok")
+            row = _engine.database_size(conn)
+            if row is not None:
+                print(f"  database_size: {row[1]}")
+            print("  ok")
         except KeyboardInterrupt:
             print("  skipped")
         except Exception as e:
@@ -838,9 +842,10 @@ def _verify(conn, integrity_check=False) -> dict:
             if miss > 100:
                 design_issues.append(f"{t}:{reason} ({detail}) — 可能Tushare断供")
 
-    from database.utils import PROJECT_ROOT
+    from database import engine as _engine
+    db_file = getattr(conn, "path", None) or _engine.DEFAULT_DB_PATH
     try:
-        size_gb = os.path.getsize(os.path.join(PROJECT_ROOT, "data", "market.db")) / 1024**3
+        size_gb = os.path.getsize(db_file) / 1024**3
     except Exception:
         size_gb = 0
 
@@ -903,9 +908,9 @@ def _cmd_verify(conn, run_id, t_start):
 
 def _cmd_cleanup(conn, dc, args, run_id, t_start):
     """--cleanup: 删除不在 REGISTRY 的孤儿表及 pull_log 残留."""
+    from database import engine as _engine
     keep = {e["table"] for e in REGISTRY} | INFRA_TABLES
-    tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    tables = set(_engine.list_tables(conn))
     orphan = tables - keep
     if orphan:
         print(f"删除 {len(orphan)} 张不在 REGISTRY 的表:")
@@ -926,9 +931,10 @@ def _cmd_cleanup(conn, dc, args, run_id, t_start):
     if orphan or stale_count:
         conn.commit()
         if orphan and args.vacuum:
-            conn.execute("VACUUM")
+            conn.execute("CHECKPOINT")
+            print("已 CHECKPOINT（DuckDB VACUUM 不回收空间，彻底压缩需 EXPORT/IMPORT 重写）")
         elif orphan:
-            print(f"提示: {len(orphan)} 张表已删除，加 --vacuum 回收磁盘空间")
+            print(f"提示: {len(orphan)} 张表已删除，加 --vacuum 触发 CHECKPOINT 回收")
         print(f"cleanup 完成（{len(orphan)} 表 + {stale_count} pull_log 残留）")
     else:
         print("无需清理")
@@ -1147,36 +1153,53 @@ def main():
     parser.add_argument("--hard", action="store_true",
                         help="配合 --cleanup，同时清理 pickle 缓存")
     parser.add_argument("--vacuum", action="store_true",
-                        help="配合 --cleanup，VACUUM 回收磁盘空间（大库耗时数分钟）")
+                        help="配合 --cleanup，CHECKPOINT 回收磁盘空间（DuckDB VACUUM 不回收）")
     args = parser.parse_args()
 
     config = load_config()
     dc = DataClient(token=config['tushare_token'])
-    conn = get_conn()
     args.since = args.since or config.get("backfill_since", DEFAULT_BACKFILL_SINCE)
 
     from database.logger import get_json_logger
+    from database import engine as _engine
     jlog = get_json_logger()
     run_id = beijing_now().strftime("%Y%m%dT%H%M%S")
     t_start = time.time()
 
-    if args.verify:
-        command, runner = "verify", lambda: _cmd_verify(conn, run_id, t_start)
-    elif args.cleanup:
-        command, runner = "cleanup", lambda: _cmd_cleanup(conn, dc, args, run_id, t_start)
-    elif args.dry_run:
-        command, runner = "dry_run", lambda: _cmd_dry_run(args, run_id, t_start)
-    elif args.refresh:
-        command, runner = "refresh", lambda: _cmd_refresh(conn, dc, args, run_id, t_start)
-    elif args.daily:
-        command, runner = "daily", lambda: _cmd_daily(conn, dc, args, config, run_id, t_start)
-    else:
-        command, runner = "backfill", lambda: _cmd_backfill(conn, dc, args, run_id, t_start)
+    command = ("verify" if args.verify else "cleanup" if args.cleanup
+               else "dry_run" if args.dry_run else "refresh" if args.refresh
+               else "daily" if args.daily else "backfill")
 
-    _log_run_start(jlog, run_id, command, args)
-    if command in ("daily", "backfill"):
-        _run_infrastructure(config, conn, dc)
-    runner()
+    if command == "dry_run":
+        # 只打印策略矩阵：不连接数据库、不建 schema、不取锁
+        _log_run_start(jlog, run_id, command, args)
+        _cmd_dry_run(args, run_id, t_start)
+        return
+
+    with _engine.db_lock(_engine.DEFAULT_DB_PATH,
+                         exclusive=(command != "verify")) as acquired:
+        if not acquired:
+            logger.error("[maintain] 数据库被其他进程占用（DuckDB 单写者），放弃本次运行")
+            return
+        conn = get_conn(read_only=(command == "verify"))
+        try:
+            if command == "verify":
+                runner = lambda: _cmd_verify(conn, run_id, t_start)
+            elif command == "cleanup":
+                runner = lambda: _cmd_cleanup(conn, dc, args, run_id, t_start)
+            elif command == "refresh":
+                runner = lambda: _cmd_refresh(conn, dc, args, run_id, t_start)
+            elif command == "daily":
+                runner = lambda: _cmd_daily(conn, dc, args, config, run_id, t_start)
+            else:
+                runner = lambda: _cmd_backfill(conn, dc, args, run_id, t_start)
+
+            _log_run_start(jlog, run_id, command, args)
+            if command in ("daily", "backfill"):
+                _run_infrastructure(config, conn, dc)
+            runner()
+        finally:
+            conn.close()
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,10 @@ from pathlib import Path
 import numpy as np
 
 
+class CorruptBinError(RuntimeError):
+    """bin 文件损坏：禁止用增量片段重建（会丢历史），须全量重转."""
+
+
 def write_bin(path: Path, values: np.ndarray) -> bool:
     """写入单个 .day.bin 文件（原子写：tmp + os.replace）.
 
@@ -57,12 +61,7 @@ def append_bin(path: Path, new_values: np.ndarray) -> bool:
                 raise ValueError(f"文件损坏: size={file_size}")
             existing_len = (file_size // 4) - 1
     except (ValueError, OSError, IndexError) as e:
-        import logging
-        logging.getLogger("convert_to_qlib").warning(
-            f"append_bin: {path} 文件损坏 ({e})，将全量重建"
-        )
-        path.unlink(missing_ok=True)
-        return write_bin(path, new_values)
+        raise CorruptBinError(f"append_bin: {path} 文件损坏 ({e})，需全量重转") from e
 
     expected_end = start_idx + existing_len
     if expected_end >= len(new_values):

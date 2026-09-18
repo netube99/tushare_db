@@ -5,7 +5,6 @@ infra 日历补拉 / --refresh freq 与 date_range 边界 / _disabled 参数标�
 _resolve_until 边界 / 策略判定顺序 / 续跑 ok 状态 / 质检断供标注 / cleanup / main 分派.
 """
 
-import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -16,18 +15,19 @@ import pytest
 import database.logger
 import database.utils
 import scripts.maintain as m
+from database.engine import connect
 from database.etl import REGISTRY
 
 CST = ZoneInfo("Asia/Shanghai")
 
 
 def make_conn():
-    conn = sqlite3.connect(":memory:")
+    conn = connect(":memory:")
     conn.execute(
-        "CREATE TABLE pull_log (table_name TEXT NOT NULL, date_val TEXT NOT NULL, "
-        "ok INTEGER NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, "
-        "last_try TEXT DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
-    conn.execute("CREATE TABLE trade_cal (cal_date TEXT, exchange TEXT, is_open INTEGER)")
+        "CREATE TABLE pull_log (table_name VARCHAR NOT NULL, date_val VARCHAR NOT NULL, "
+        "ok BIGINT NOT NULL, retry_count BIGINT NOT NULL DEFAULT 0, "
+        "last_try VARCHAR DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
+    conn.execute("CREATE TABLE trade_cal (cal_date VARCHAR, exchange VARCHAR, is_open BIGINT)")
     return conn
 
 
@@ -97,17 +97,14 @@ def daily_env(monkeypatch):
 
 def test_partition_replace_atomic_on_upsert_failure(monkeypatch):
     conn = make_conn()
-    conn.execute("CREATE TABLE t_part (ts_code TEXT, ann_date TEXT)")
+    conn.execute(
+        "CREATE TABLE t_part (ts_code VARCHAR, "
+        "ann_date VARCHAR CHECK (ann_date <> '20250101'))")
     conn.execute("INSERT INTO t_part VALUES ('000001.SZ', '20200101')")
     conn.commit()
     entry = {"api": "stk_holdernumber", "table": "t_part", "date_col": "ann_date",
              "partition_key": "ts_code"}
     monkeypatch.setattr(m, "REGISTRY", [entry])
-
-    def boom(conn, table, df, drop_null_pk=True, replace_all=True):
-        raise RuntimeError("disk full")
-
-    monkeypatch.setattr(m, "upsert_df", boom)
 
     df = pd.DataFrame([{"ts_code": "000001.SZ", "ann_date": "20250101"}])
     ok = m._pull_and_store(conn, "t_part", df, "000001.SZ__once__",
@@ -123,7 +120,7 @@ def test_partition_replace_atomic_on_upsert_failure(monkeypatch):
 
 def test_partition_replace_updates_only_pulled_codes(monkeypatch):
     conn = make_conn()
-    conn.execute("CREATE TABLE t_part (ts_code TEXT, ann_date TEXT)")
+    conn.execute("CREATE TABLE t_part (ts_code VARCHAR, ann_date VARCHAR)")
     conn.execute("INSERT INTO t_part VALUES ('000001.SZ', '20200101')")
     conn.execute("INSERT INTO t_part VALUES ('000002.SZ', '20200101')")
     entry = {"api": "stk_holdernumber", "table": "t_part", "date_col": "ann_date",
@@ -150,8 +147,8 @@ def test_partition_replace_updates_only_pulled_codes(monkeypatch):
 
 def test_daily_domain_once_bypasses_max_date_gate(daily_env, monkeypatch):
     conn = daily_env
-    conn.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT)")
-    conn.execute("CREATE TABLE dividend (ts_code TEXT, ann_date TEXT, div_proc TEXT)")
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE dividend (ts_code VARCHAR, ann_date VARCHAR, div_proc VARCHAR)")
     conn.executemany("INSERT INTO stk_factor_pro (ts_code) VALUES (?)",
                      [("000001.SZ",), ("000002.SZ",)])
     conn.execute("INSERT INTO dividend VALUES ('000001.SZ', '20260901', '实施')")
@@ -174,7 +171,7 @@ def test_daily_domain_once_bypasses_max_date_gate(daily_env, monkeypatch):
 
 def test_daily_ok2_window_respects_seven_days(daily_env, monkeypatch):
     conn = daily_env
-    conn.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT)")
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
     monkeypatch.setattr(m, "REGISTRY",
                         [next(e for e in REGISTRY if e["table"] == "stk_factor_pro")])
     fixed = datetime(2026, 9, 13, 20, 30, 0, tzinfo=CST)
@@ -239,7 +236,7 @@ def _freq_api_index():
 def test_refresh_freq_clears_and_repulls_all_freq_keys(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20250102"])
-    conn.execute("CREATE TABLE t_freq (ts_code TEXT, trade_date TEXT, freq TEXT)")
+    conn.execute("CREATE TABLE t_freq (ts_code VARCHAR, trade_date VARCHAR, freq VARCHAR)")
     entry = {"api": "fake_freq_api", "table": "t_freq", "date_col": "trade_date"}
     monkeypatch.setattr(m, "REGISTRY", [entry])
     monkeypatch.setattr(database.utils, "load_api_registry", _freq_api_index)
@@ -265,7 +262,7 @@ def test_auto_fix_bounds_date_range_truncates_to_year():
 def test_refresh_date_range_with_full_date(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20250102", "20250103"])
-    conn.execute("CREATE TABLE gz_index (date TEXT)")
+    conn.execute("CREATE TABLE gz_index (date VARCHAR)")
     entry = next(e for e in REGISTRY if e["table"] == "gz_index")
     monkeypatch.setattr(m, "REGISTRY", [entry])
     pl(conn, "gz_index", "2025", 1)
@@ -377,7 +374,7 @@ def test_trade_date_strategy_resumes_by_ok_state(monkeypatch):
     conn = make_conn()
     days = ["20250102", "20250103", "20250106", "20250107", "20250108"]
     add_cal(conn, days)
-    conn.execute("CREATE TABLE t_td (ts_code TEXT, trade_date TEXT)")
+    conn.execute("CREATE TABLE t_td (ts_code VARCHAR, trade_date VARCHAR)")
     pl(conn, "t_td", "20250102", 1)
     pl(conn, "t_td", "20250103", 2)
     pl(conn, "t_td", "20250106", 0)
@@ -405,7 +402,7 @@ def test_trade_date_strategy_resumes_by_ok_state(monkeypatch):
 def test_date_range_strategy_year_split(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20241230", "20241231", "20250102", "20250103"])
-    conn.execute("CREATE TABLE gz_index (date TEXT)")
+    conn.execute("CREATE TABLE gz_index (date VARCHAR)")
     entry = next(e for e in REGISTRY if e["table"] == "gz_index")
     monkeypatch.setattr(m, "REGISTRY", [entry])
     dc = FakeDC(responses={"gz_index": pd.DataFrame([{"date": "20250102"}])})
@@ -434,7 +431,7 @@ def test_verify_flags_over_100_day_gap(monkeypatch):
             weekdays.append(d.strftime("%Y%m%d"))
         d += timedelta(days=1)
     add_cal(conn, weekdays)
-    conn.execute("CREATE TABLE t_gap (ts_code TEXT, trade_date TEXT)")
+    conn.execute("CREATE TABLE t_gap (ts_code VARCHAR, trade_date VARCHAR)")
     for d in weekdays[:5]:
         conn.execute("INSERT INTO t_gap VALUES ('000001.SZ', ?)", (d,))
     entry = {"api": "fake_gap", "table": "t_gap", "date_col": "trade_date"}
@@ -451,8 +448,8 @@ def test_verify_domain_monthly_coverage(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20250102", "20250103", "20250205", "20250206",
                    "20250303", "20250304"])
-    conn.execute("CREATE TABLE index_weight (index_code TEXT, con_code TEXT, "
-                 "trade_date TEXT)")
+    conn.execute("CREATE TABLE index_weight (index_code VARCHAR, con_code VARCHAR, "
+                 "trade_date VARCHAR)")
     for td in ("20250102", "20250205"):
         conn.execute("INSERT INTO index_weight VALUES ('000300.SH', '000001.SZ', ?)",
                      (td,))
@@ -472,8 +469,8 @@ def test_verify_domain_monthly_coverage(monkeypatch):
 
 def test_cleanup_drops_orphans_and_stale_pull_log(monkeypatch):
     conn = make_conn()
-    conn.execute("CREATE TABLE etf_basic (ts_code TEXT)")
-    conn.execute("CREATE TABLE zzz_orphan (a TEXT)")
+    conn.execute("CREATE TABLE etf_basic (ts_code VARCHAR)")
+    conn.execute("CREATE TABLE zzz_orphan (a VARCHAR)")
     pl(conn, "zzz_orphan", "20250102", 1)
     pl(conn, "etf_basic", "20250102", 1)
     conn.commit()
@@ -483,11 +480,39 @@ def test_cleanup_drops_orphans_and_stale_pull_log(monkeypatch):
     m._cmd_cleanup(conn, dc, _Args(vacuum=False, hard=False), "run", 0.0)
 
     tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
+        "SELECT table_name FROM duckdb_tables()")}
     assert "zzz_orphan" not in tables
     assert {"pull_log", "trade_cal", "etf_basic"} <= tables
     left = {r[0] for r in conn.execute("SELECT table_name FROM pull_log")}
     assert left == {"etf_basic"}
+
+
+def test_cleanup_keeps_derived_physical_tables(monkeypatch):
+    conn = make_conn()
+    conn.execute("CREATE TABLE national_team_daily (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE pension_float_daily (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE zzz_orphan (a VARCHAR)")
+    monkeypatch.setattr(m, "REGISTRY", [])
+
+    m._cmd_cleanup(conn, FakeDC(), _Args(vacuum=False, hard=False), "run", 0.0)
+
+    tables = {r[0] for r in conn.execute("SELECT table_name FROM duckdb_tables()")}
+    assert {"national_team_daily", "pension_float_daily"} <= tables
+    assert "zzz_orphan" not in tables
+
+
+def test_dry_run_does_not_open_database(monkeypatch):
+    monkeypatch.setattr(m, "load_config",
+                        lambda: {"tushare_token": "x", "backfill_since": "20200101"})
+    monkeypatch.setattr(m, "DataClient", lambda token: object())
+
+    def boom(*args, **kwargs):
+        raise AssertionError("dry-run 不应连接数据库或取锁")
+
+    monkeypatch.setattr(m, "get_conn", boom)
+    monkeypatch.setattr(database.engine, "db_lock", boom)
+    monkeypatch.setattr(sys, "argv", ["maintain.py", "--dry-run"])
+    m.main()
 
 
 def test_cleanup_hard_clears_cache(monkeypatch):
@@ -505,10 +530,15 @@ def test_cleanup_hard_clears_cache(monkeypatch):
 
 def test_main_dispatch(monkeypatch):
     calls = []
+
+    class FakeConn:
+        def close(self):
+            pass
+
     monkeypatch.setattr(m, "load_config",
                         lambda: {"tushare_token": "x", "backfill_since": "20200101"})
     monkeypatch.setattr(m, "DataClient", lambda token: object())
-    monkeypatch.setattr(m, "get_conn", lambda: object())
+    monkeypatch.setattr(m, "get_conn", lambda *a, **k: FakeConn())
     for name in ("_cmd_verify", "_cmd_cleanup", "_cmd_dry_run", "_cmd_refresh",
                  "_cmd_daily", "_cmd_backfill"):
         monkeypatch.setattr(m, name, (lambda _n: lambda *a: calls.append(_n))(name))
@@ -605,10 +635,10 @@ def test_infra_reinits_schema_after_regeneration(monkeypatch):
     real_load = database.utils.load_schema_sql
     monkeypatch.setattr(
         database.utils, "load_schema_sql",
-        lambda: real_load() + "\nCREATE TABLE IF NOT EXISTS zz_new_table(a TEXT);")
+        lambda: real_load() + "\nCREATE TABLE IF NOT EXISTS zz_new_table(a VARCHAR);")
 
     m._run_infrastructure({}, conn, FakeDC())
 
     names = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
+        "SELECT table_name FROM duckdb_tables()")}
     assert "zz_new_table" in names

@@ -15,13 +15,13 @@ from database.utils import atomic_write_text, load_api_registry
 # ── 纯函数 ──
 
 def sql_type(tushare_type: str | None) -> str:
-    """Tushare 类型 → SQLite 类型."""
+    """Tushare 类型 → DuckDB 类型（int→BIGINT 防 int32 溢出，float→DOUBLE 保精度）."""
     t = str(tushare_type).lower() if tushare_type is not None else ""
     if t in ("int", "integer"):
-        return "INTEGER"
+        return "BIGINT"
     if t == "float":
-        return "REAL"
-    return "TEXT"
+        return "DOUBLE"
+    return "VARCHAR"
 
 
 def infer_pk(api: dict, driver: dict | None = None) -> str | None:
@@ -99,6 +99,25 @@ _SQL_KEYWORDS = {
 }
 
 
+def _load_duckdb_reserved() -> set[str]:
+    """运行时读取 DuckDB 保留字，避免版本升级后新增关键字导致 DDL 断裂."""
+    try:
+        import duckdb
+        con = duckdb.connect()
+        try:
+            rows = con.execute(
+                "SELECT keyword_name FROM duckdb_keywords() "
+                "WHERE keyword_category = 'reserved'").fetchall()
+        finally:
+            con.close()
+        return {str(r[0]).lower() for r in rows}
+    except Exception:
+        return set()
+
+
+_SQL_KEYWORDS |= _load_duckdb_reserved()
+
+
 def _quote_name(name: str) -> str:
     """如果列名需要引号则加双引号（SQL保留字/数字开头/含特殊字符）."""
     if name.lower() in _SQL_KEYWORDS:
@@ -128,22 +147,77 @@ def generate_table_ddl(api: dict, driver: dict | None = None) -> str:
 
 INFRA_DDL = """-- 交易日历（时间锚点）
 CREATE TABLE IF NOT EXISTS trade_cal (
-    exchange       TEXT NOT NULL,
-    cal_date       TEXT NOT NULL,
-    is_open        INTEGER NOT NULL,
-    pretrade_date  TEXT,
+    exchange       VARCHAR NOT NULL,
+    cal_date       VARCHAR NOT NULL,
+    is_open        BIGINT NOT NULL,
+    pretrade_date  VARCHAR,
     PRIMARY KEY (exchange, cal_date)
 );
 
 -- 拉取日志（驱动回填判断）
 CREATE TABLE IF NOT EXISTS pull_log (
-    table_name  TEXT NOT NULL,
-    date_val    TEXT NOT NULL,
-    ok          INTEGER NOT NULL,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    last_try    TEXT DEFAULT NULL,
+    table_name  VARCHAR NOT NULL,
+    date_val    VARCHAR NOT NULL,
+    ok          BIGINT NOT NULL,
+    retry_count BIGINT NOT NULL DEFAULT 0,
+    last_try    VARCHAR DEFAULT NULL,
     PRIMARY KEY (table_name, date_val)
 );
+"""
+
+
+# ── 派生视图 DDL（下游适配器消费的稳定契约）──
+# 视图从物理表聚合出 (ts_code, 日期) 唯一键，供 ddup adapters/tushare.py 读取。
+# 用 DROP VIEW IF EXISTS + CREATE VIEW（而非 IF NOT EXISTS）保证 init_schema
+# 每次执行都把 DB 中的旧定义替换为仓库当前定义。
+DERIVED_VIEWS_DDL = """-- 现金分红事件（ex_date 作 trade_date，仅除息日有值）
+DROP VIEW IF EXISTS dividend_grid;
+CREATE VIEW dividend_grid AS
+  SELECT ts_code, ex_date AS trade_date, SUM(cash_div) AS cash_div
+  FROM dividend
+  WHERE div_proc='实施' AND cash_div > 0 AND ex_date IS NOT NULL
+  GROUP BY ts_code, ex_date;
+
+-- 股东人数（同公告取 MAX 披露口径）
+DROP VIEW IF EXISTS stk_holdernumber_agg;
+CREATE VIEW stk_holdernumber_agg AS
+  SELECT ts_code, ann_date, MAX(holder_num) AS holder_num
+  FROM stk_holdernumber WHERE holder_num IS NOT NULL GROUP BY ts_code, ann_date;
+
+-- 股东增减持（change_vol/change_ratio 按 in_de 带符号，DE=负；
+-- change_ratio 为绝对变动股数加权的带符号平均比例，分母仍为绝对股数之和）
+DROP VIEW IF EXISTS stk_holdertrade_agg;
+CREATE VIEW stk_holdertrade_agg AS
+  SELECT ts_code, ann_date,
+         SUM(CASE WHEN in_de = 'DE' THEN -change_vol ELSE change_vol END) AS change_vol,
+         SUM(CASE WHEN in_de = 'DE' THEN -change_vol * change_ratio
+                  ELSE change_vol * change_ratio END)
+             / NULLIF(SUM(change_vol), 0) AS change_ratio
+  FROM stk_holdertrade
+  GROUP BY ts_code, ann_date;
+
+-- 股权质押（同公告取 MAX 披露比例，保守口径）
+DROP VIEW IF EXISTS pledge_detail_agg;
+CREATE VIEW pledge_detail_agg AS
+  SELECT ts_code, ann_date,
+         MAX(p_total_ratio) AS p_total_ratio,
+         MAX(h_total_ratio) AS h_total_ratio
+  FROM pledge_detail
+  GROUP BY ts_code, ann_date;
+
+-- 龙虎榜机构席位聚合（top_inst 为逐席位多行，2026-09 起不再折叠：
+-- 原 PK(ts_code, trade_date) 会把多席位 INSERT OR REPLACE 成任意单行）。
+-- 机构口径 = exalter='机构专用'；inst_buy_rate = 机构买入额 / 全体上榜席位买入额。
+DROP VIEW IF EXISTS top_inst_agg;
+CREATE VIEW top_inst_agg AS
+  SELECT ts_code, trade_date,
+         SUM(CASE WHEN exalter = '机构专用' THEN net_buy ELSE 0 END) AS inst_net_buy,
+         SUM(CASE WHEN exalter = '机构专用' THEN buy ELSE 0 END) AS inst_buy,
+         SUM(buy) AS total_buy,
+         SUM(CASE WHEN exalter = '机构专用' THEN buy ELSE 0 END)
+             / NULLIF(SUM(buy), 0) AS inst_buy_rate
+  FROM top_inst
+  GROUP BY ts_code, trade_date;
 """
 
 
@@ -159,6 +233,7 @@ def generate_schema(api_list: list[dict]) -> str:
         ddl = generate_table_ddl(api, (api.get("_project") or {}).get("driver"))
         if ddl:
             blocks.append(f"-- {api.get('title', api['api_name'])}\n{ddl}")
+    blocks.append(DERIVED_VIEWS_DDL.rstrip())
     return "\n\n".join(blocks) + "\n"
 
 
@@ -197,6 +272,8 @@ def generate_registry(api_list: list[dict]) -> str:
             frags.append(', "null_pk_keep": True')
         if upsert.get("partition_key"):
             frags.append(f', "partition_key": "{upsert["partition_key"]}"')
+        if upsert.get("dedupe_cols"):
+            frags.append(f', "dedupe_cols": {_json.dumps(upsert["dedupe_cols"])}')
         if proj.get("default_params"):
             frags.append(
                 f', "default_params": {_json.dumps(proj["default_params"])}')

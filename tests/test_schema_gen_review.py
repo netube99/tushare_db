@@ -2,13 +2,14 @@
 
 import ast
 import json
-import sqlite3
 
 import pytest
 
 import scripts.classify_apis as classify_apis
+from database.engine import connect, execute_script
 from scripts.classify_apis import _parse_rate, classify
 from scripts.generate_schema import (
+    DERIVED_VIEWS_DDL,
     _quote_name,
     generate_registry,
     generate_schema,
@@ -134,14 +135,14 @@ def test_classify_main_writeback_and_idempotent(index_env):
 # ── sql_type ──
 
 def test_sql_type_mapping():
-    assert sql_type("str") == "TEXT"
-    assert sql_type(None) == "TEXT"
-    assert sql_type("datetime") == "TEXT"
-    assert sql_type("float") == "REAL"
-    assert sql_type("int") == "INTEGER"
-    assert sql_type("integer") == "INTEGER"
-    assert sql_type("unknown_type") == "TEXT"
-    assert sql_type("FLOAT") == "REAL"
+    assert sql_type("str") == "VARCHAR"
+    assert sql_type(None) == "VARCHAR"
+    assert sql_type("datetime") == "VARCHAR"
+    assert sql_type("float") == "DOUBLE"
+    assert sql_type("int") == "BIGINT"
+    assert sql_type("integer") == "BIGINT"
+    assert sql_type("unknown_type") == "VARCHAR"
+    assert sql_type("FLOAT") == "DOUBLE"
 
 
 # ── infer_pk 优先级（pk_override / no_pk / driver 路径） ──
@@ -191,8 +192,8 @@ def test_generate_table_ddl_keyword_column_executes():
                                                {"name": "v", "type": "float"}]}
     ddl = generate_table_ddl(api)
     assert 'IF NOT EXISTS' in ddl
-    conn = sqlite3.connect(":memory:")
-    conn.executescript(ddl)
+    conn = connect(":memory:")
+    execute_script(conn, ddl)
     conn.execute('INSERT INTO "t1" ("to", v) VALUES (?, ?)', ("x", 1.0))
     conn.close()
 
@@ -288,12 +289,115 @@ def test_schema_and_registry_dedup_by_api_name():
     assert len(_registry_entries(reg)) == 1
 
 
+# ── 派生视图 DDL（defect 3：stk_holdertrade_agg 带符号 + 契约持久化） ──
+
+VIEW_NAMES = ("dividend_grid", "stk_holdernumber_agg",
+              "stk_holdertrade_agg", "pledge_detail_agg", "top_inst_agg")
+
+
+def test_generate_schema_embeds_derived_views():
+    sql = generate_schema([])
+    for view in VIEW_NAMES:
+        assert f"DROP VIEW IF EXISTS {view};" in sql
+        assert f"CREATE VIEW {view} AS" in sql
+    assert "CASE WHEN in_de = 'DE' THEN -change_vol" in sql
+
+
+@pytest.fixture()
+def view_conn():
+    conn = connect(":memory:")
+    execute_script(
+        conn,
+        """CREATE TABLE stk_holdertrade (
+             ts_code VARCHAR, ann_date VARCHAR, in_de VARCHAR,
+             change_vol DOUBLE, change_ratio DOUBLE);
+           CREATE TABLE pledge_detail (
+             ts_code VARCHAR, ann_date VARCHAR, p_total_ratio DOUBLE, h_total_ratio DOUBLE);
+           CREATE TABLE stk_holdernumber (
+             ts_code VARCHAR, ann_date VARCHAR, holder_num DOUBLE);
+           CREATE TABLE dividend (
+             ts_code VARCHAR, div_proc VARCHAR, cash_div DOUBLE, ex_date VARCHAR);
+           CREATE TABLE top_inst (
+             ts_code VARCHAR, trade_date VARCHAR, exalter VARCHAR, side VARCHAR,
+             buy DOUBLE, sell DOUBLE, net_buy DOUBLE);"""
+    )
+    execute_script(conn, DERIVED_VIEWS_DDL)
+    yield conn
+    conn.close()
+
+
+def test_top_inst_agg_institution_rows_only(view_conn):
+    """多席位：机构口径只取 exalter='机构专用'，买入占比=机构买入/全体席位买入。"""
+    view_conn.execute(
+        "INSERT INTO top_inst VALUES ('000001.SZ','20240605','机构专用','0',300.0,100.0,200.0)")
+    view_conn.execute(
+        "INSERT INTO top_inst VALUES ('000001.SZ','20240605','某营业部','0',100.0,400.0,-300.0)")
+    net, rate = view_conn.execute(
+        "SELECT inst_net_buy, inst_buy_rate FROM top_inst_agg "
+        "WHERE ts_code='000001.SZ'").fetchone()
+    assert net == 200.0
+    assert rate == pytest.approx(0.75)  # 300 / (300+100)
+
+
+def test_stk_holdertrade_agg_signs_de_as_negative(view_conn):
+    view_conn.execute(
+        "INSERT INTO stk_holdertrade VALUES ('600267.SH','20230520','DE',100.0,47.10)")
+    view_conn.execute(
+        "INSERT INTO stk_holdertrade VALUES ('000001.SZ','20240101','IN',200.0,3.0)")
+    vol, ratio = view_conn.execute(
+        "SELECT change_vol, change_ratio FROM stk_holdertrade_agg "
+        "WHERE ts_code='600267.SH'").fetchone()
+    assert vol == -100.0
+    assert ratio == pytest.approx(-47.10)
+
+
+def test_stk_holdertrade_agg_mixed_direction_net(view_conn):
+    view_conn.execute(
+        "INSERT INTO stk_holdertrade VALUES ('000002.SZ','20240101','IN',100.0,2.0)")
+    view_conn.execute(
+        "INSERT INTO stk_holdertrade VALUES ('000002.SZ','20240101','DE',100.0,4.0)")
+    vol, ratio = view_conn.execute(
+        "SELECT change_vol, change_ratio FROM stk_holdertrade_agg "
+        "WHERE ts_code='000002.SZ'").fetchone()
+    assert vol == 0.0
+    assert ratio == pytest.approx(-1.0)   # (100*2 - 100*4) / 200
+
+
+# ── top_inst：逐席位多行（defect 5），no_pk + 交易日分区替换 ──
+
+def test_top_inst_no_pk_allows_multi_seat_rows():
+    api = {
+        "api_name": "top_inst",
+        "output_params": [{"name": "trade_date"}, {"name": "ts_code"},
+                          {"name": "exalter"}, {"name": "side"},
+                          {"name": "buy"}, {"name": "net_buy"}],
+        "_project": {
+            "classification": {"rule": 1, "usable": True},
+            "no_pk": True,
+            "date_col": "trade_date",
+            "upsert": {"partition_key": "trade_date"},
+        },
+    }
+    assert infer_pk(api) is None
+    assert "PRIMARY KEY" not in generate_table_ddl(api)
+    entry = _registry_entries(generate_registry([api]))[0]
+    assert _entry_value(entry, "date_col") == "trade_date"
+    assert _entry_value(entry, "partition_key") == "trade_date"
+
+
+def test_real_top_inst_schema_is_multi_seat():
+    from database.utils import load_api_registry
+    api = next(a for a in load_api_registry() if a["api_name"] == "top_inst")
+    assert api["_project"].get("no_pk") is True
+    assert "PRIMARY KEY" not in generate_table_ddl(api)
+
+
 # ── inject_registry（tmp 副本，绝不触碰真实 database/etl.py） ──
 
 ETL_TEMPLATE = '''"""ETL."""
 from __future__ import annotations
 
-import sqlite3
+from database.engine import Connection
 
 # ---------- REGISTRY ----------
 # 自动生成，勿手工编辑。运行 scripts/generate_schema.py 重新生成

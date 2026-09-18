@@ -11405,6 +11405,13 @@
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
         "date_mode": "once"
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -13655,6 +13662,11 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "no_pk": true,
+      "date_col": "trade_date",
+      "upsert": {
+        "partition_key": "trade_date"
       },
       "classification": {
         "rule": 1,
@@ -22424,14 +22436,20 @@
         "effective_rate": 500,
         "recommended_interval_ms": 150
       },
-      "pk_override": "(ts_code, ann_date, div_proc)",
+      "no_pk": true,
+      "date_col": "ann_date",
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
         "date_mode": "once"
       },
       "upsert": {
-        "null_pk_keep": true
+        "partition_key": "ts_code",
+        "dedupe_cols": [
+          "ts_code",
+          "ann_date",
+          "div_proc"
+        ]
       }
     }
   },

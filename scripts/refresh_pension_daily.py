@@ -9,6 +9,10 @@ C6 财报对齐契约：引擎只消费 (交易日, 代码) 日频网格上的�
 本表在数据层按公告日(ann_date)对齐成日频列：披露日起前向携带持有状态至下一披露日，
 超过 STALE_DAYS 个自然日未再披露则过期（=养老组合退出十大流通股东后信号失效）。
 
+同一公告日可能同时披露多个报告期（如年报+一季报同日，end_date=20251231 与 20260331
+各带一条同持有人记录），SUM 会把同一持仓计两次。故先按 (ts_code, ann_date, end_date)
+聚合再取最新 end_date（ROW_NUMBER），持股比例/变动只计最新报告期。
+
 物理表（非 VIEW）：SQL 侧 window CTE + 范围 JOIN 计划不可控，用 pandas 组装后落库。
 top10_floatholders 增量更新后需重跑本脚本刷新。
 
@@ -18,12 +22,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import sys
 
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database import engine
+from database.engine import Connection
 
 from scripts._derived_tables import (
     DEFAULT_DB,
@@ -50,36 +56,50 @@ TMP_TABLE = "pension_float_daily__new"
 
 CREATE_SQL = """
 CREATE TABLE {table} (
-    ts_code    TEXT NOT NULL,
-    trade_date TEXT NOT NULL,
-    pen_cnt         INTEGER,
-    pen_ratio_sum   REAL,
-    pen_float_ratio_sum REAL,
-    pen_chg_sum     REAL,
-    pen_amount_sum  REAL,
-    pen_age         INTEGER,
-    pen_ann_date    TEXT,
+    ts_code    VARCHAR NOT NULL,
+    trade_date VARCHAR NOT NULL,
+    pen_cnt         BIGINT,
+    pen_ratio_sum   DOUBLE,
+    pen_float_ratio_sum DOUBLE,
+    pen_chg_sum     DOUBLE,
+    pen_amount_sum  DOUBLE,
+    pen_age         BIGINT,
+    pen_ann_date    VARCHAR,
     PRIMARY KEY (ts_code, trade_date)
 )
 """
 
 EVENTS_SQL = """
-    SELECT ts_code, ann_date,
-           COUNT(DISTINCT holder_name) AS pen_cnt,
-           SUM(hold_ratio)             AS pen_ratio_sum,
-           SUM(hold_float_ratio)       AS pen_float_ratio_sum,
-           SUM(hold_change)            AS pen_chg_sum,
-           SUM(hold_amount)            AS pen_amount_sum
-    FROM top10_floatholders
-    WHERE ann_date IS NOT NULL AND holder_type = '基本养老保险基金'
-    GROUP BY ts_code, ann_date
+    WITH per_period AS (
+        SELECT ts_code, ann_date, end_date,
+               COUNT(DISTINCT holder_name) AS pen_cnt,
+               SUM(hold_ratio)             AS pen_ratio_sum,
+               SUM(hold_float_ratio)       AS pen_float_ratio_sum,
+               SUM(hold_change)            AS pen_chg_sum,
+               SUM(hold_amount)            AS pen_amount_sum
+        FROM top10_floatholders
+        WHERE ann_date IS NOT NULL AND holder_type = '基本养老保险基金'
+        GROUP BY ts_code, ann_date, end_date
+    ),
+    latest_period AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY ts_code, ann_date
+                   ORDER BY end_date DESC NULLS LAST
+               ) AS rn
+        FROM per_period
+    )
+    SELECT ts_code, ann_date, pen_cnt, pen_ratio_sum, pen_float_ratio_sum,
+           pen_chg_sum, pen_amount_sum
+    FROM latest_period
+    WHERE rn = 1
     ORDER BY ts_code, ann_date
 """
 
 
-def build(conn: sqlite3.Connection) -> pd.DataFrame:
+def build(conn: Connection) -> pd.DataFrame:
     return carry_expand(
-        conn, pd.read_sql_query(EVENTS_SQL, conn), METRIC_COLS, "pen", STALE_DAYS, COLUMNS
+        conn, conn.execute(EVENTS_SQL).df(), METRIC_COLS, "pen", STALE_DAYS, COLUMNS
     )
 
 
@@ -88,15 +108,16 @@ def main() -> None:
     ap.add_argument("--db", default=DEFAULT_DB)
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
-    try:
-        require_tables(conn, SOURCE_TABLES)
-        out = build(conn)
-        atomic_replace(conn, TMP_TABLE, FINAL_TABLE, CREATE_SQL, out, chunksize=100)
-        stocks, lo, hi = final_span(conn, FINAL_TABLE)
-        print(f"pension_float_daily: {len(out)} 行, {stocks} 只股票, {lo} ~ {hi} (STALE_DAYS={STALE_DAYS})")
-    finally:
-        conn.close()
+    with engine.db_lock(args.db, exclusive=True):
+        conn = engine.connect(args.db)
+        try:
+            require_tables(conn, SOURCE_TABLES)
+            out = build(conn)
+            atomic_replace(conn, TMP_TABLE, FINAL_TABLE, CREATE_SQL, out)
+            stocks, lo, hi = final_span(conn, FINAL_TABLE)
+            print(f"pension_float_daily: {len(out)} 行, {stocks} 只股票, {lo} ~ {hi} (STALE_DAYS={STALE_DAYS})")
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

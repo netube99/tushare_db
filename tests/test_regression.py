@@ -53,8 +53,6 @@ def test_build_field_map_opt_keys_exist_in_specs():
 
 def test_key_map_consistency():
     """P0-4 回归: agg_count → agg_count_col, agg_weighted → agg_weighted_cols, agg_split_col → agg_col."""
-    import sqlite3
-    from database.utils import get_conn
 
     REQ_ENTRY_KEYS = {"agg_count_col", "agg_weighted_cols", "agg_col"}
 
@@ -79,13 +77,12 @@ def test_key_map_consistency():
 
 def test_agg_key_mapping_applied():
     """验证 build_field_map 正确应用了 key_map 重映射."""
-    import sqlite3
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
+    from database.engine import connect
+    db = connect(":memory:")
 
     for spec in TABLE_SPECS:
         if spec.get("agg_count"):
-            db.execute(f"CREATE TABLE {spec['table']} ({spec['inst_col'] or 'col'} TEXT, {spec['date_col']} TEXT, val REAL)")
+            db.execute(f"CREATE TABLE {spec['table']} ({spec['inst_col'] or 'col'} VARCHAR, {spec['date_col']} VARCHAR, val DOUBLE)")
     db.commit()
 
     try:

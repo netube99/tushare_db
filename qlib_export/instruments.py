@@ -1,8 +1,9 @@
 """品种清单管理 — InstrumentSync + IndexConstituentSync + get_instruments_for_table."""
 
-import sqlite3
 from datetime import date
 from pathlib import Path
+
+from database.engine import Connection
 
 from qlib_export.calendar import format_date as _format_date_raw
 from qlib_export.specs import INSTRUMENT_SOURCES, VIRTUAL_INSTRUMENTS, _table_exists
@@ -57,7 +58,7 @@ def qlib_to_ts_code(inst: str, inst_type: str) -> str:
     return f"{code}.{exchange}"
 
 
-def _query_delisted_stock_ranges(conn: sqlite3.Connection) -> list[tuple]:
+def _query_delisted_stock_ranges(conn: Connection) -> list[tuple]:
     """从 stk_factor_pro 查所有 ts_code 的日期范围（含退市股）."""
     return conn.execute(
         "SELECT ts_code, MIN(trade_date), MAX(trade_date) "
@@ -83,7 +84,7 @@ class InstrumentSync:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
 
-    def full_init(self, conn: sqlite3.Connection) -> None:
+    def full_init(self, conn: Connection) -> None:
         """全量构建 instruments/all.txt."""
         entries = []
 
@@ -159,7 +160,7 @@ class IndexConstituentSync:
         self.output_dir = output_dir
         self.instruments_dir = output_dir / "instruments"
 
-    def full_sync(self, conn: sqlite3.Connection) -> None:
+    def full_sync(self, conn: Connection) -> None:
         """全量生成所有指数的成分股 TSV 文件."""
         self.instruments_dir.mkdir(parents=True, exist_ok=True)
 
@@ -228,7 +229,7 @@ class IndexConstituentSync:
         )
 
 
-def get_instruments_for_table(conn: sqlite3.Connection, table_cfg: dict) -> list[str]:
+def get_instruments_for_table(conn: Connection, table_cfg: dict) -> list[str]:
     """返回某表应处理的所有 qlib instrument 名称."""
     if table_cfg.get("virtual_inst"):
         return [table_cfg["virtual_inst"]]

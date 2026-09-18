@@ -1,6 +1,6 @@
 # AGENTS.md — tushare_db
 
-tushare_db：Tushare_Pro → SQLite → Qlib 数据管道。
+tushare_db：Tushare_Pro → DuckDB → Qlib 数据管道。
 
 - 流水线：`api_index.json` → `classify_apis.py`（分级）→ `generate_schema.py`（DDL + REGISTRY）→ `maintain.py`（拉取落库）
 - 导出：`convert_to_qlib.py` 委托 `qlib_export/`，输出 Qlib bin
@@ -24,10 +24,10 @@ python scripts/maintain.py --since 20200101 --until 20210101
 # 单接口维护
 python scripts/maintain.py --api stk_factor_pro
 
-# 质检报告（含 PRAGMA integrity_check）
+# 质检报告（只读，含库大小与覆盖率）
 python scripts/maintain.py --verify
 
-# 清理孤儿表 / 缓存 / VACUUM
+# 清理孤儿表 / 缓存 / CHECKPOINT
 python scripts/maintain.py --cleanup
 python scripts/maintain.py --cleanup --hard
 python scripts/maintain.py --cleanup --vacuum
@@ -51,6 +51,10 @@ python scripts/convert_to_qlib.py --fields open,high
 python scripts/classify_apis.py
 python scripts/generate_schema.py
 
+# SQLite → DuckDB 一次性数据迁移（--dry-run 预览 / --resume 续迁）
+python scripts/migrate_sqlite_to_duckdb.py --dry-run
+python scripts/migrate_sqlite_to_duckdb.py
+
 # 测试（无需真实数据库）
 pytest tests/ -v
 ```
@@ -69,7 +73,7 @@ classify_apis.py ──→ _project.classification 写回 api_index.json
 generate_schema.py ──→ schema.sql + REGISTRY 注入 etl.py
        │
        ▼
-maintain.py ──→ DataClient ──→ Tushare API ──→ market.db (SQLite WAL)
+maintain.py ──→ DataClient ──→ Tushare API ──→ market.duckdb (DuckDB)
        │
        ▼
 convert_to_qlib.py ──→ qlib_export/ ──→ data/qlib_bin/cn_data (Qlib bin)
@@ -87,7 +91,25 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 - `generate_schema.py` 读 classification → 写 `schema.sql` + 重写 `etl.py`，不依赖 client/
 - `maintain.py` 通过 subprocess 调用前两者，拉取后 `importlib.reload(etl)` 热加载 REGISTRY
 - `convert_to_qlib.py` 是瘦 CLI，委托 `qlib_export/` 子模块
-- `qlib_export/` 通过 `get_conn()` 直连 market.db，不经过 DataClient
+- `qlib_export/` 通过 `get_conn()` 直连 market.duckdb，不经过 DataClient
+- `database/engine.py` 是唯一的连接/行访问/元数据/跨进程锁层，业务代码不直接 import duckdb
+
+---
+
+## DuckDB 存储与并发
+
+- 单文件 `data/market.duckdb`；DuckDB 是单写者模型，跨进程不允许读写并存。
+- `engine.db_lock()` 用 `data/.market.lock` 文件锁串行化：maintain / convert 取排他锁，
+  `--verify` 取共享锁且以 `get_conn(read_only=True)` 打开；`--dry-run` 不连库不取锁。
+- 类型：str/None/datetime → VARCHAR，int → BIGINT，float → DOUBLE（不要用 REAL，DuckDB 的 REAL 是 float4）。
+- `upsert_df` 用 `register(df) + INSERT [OR REPLACE] INTO ... SELECT TRY_CAST(...)`：
+  - 批内重复键按 `keep="last"` 去重（DuckDB 原生保留首行，与 SQLite REPLACE 相反）
+  - 无 PK/UNIQUE 的表走普通 INSERT；分区表由 `pre_delete` 在事务内先删后插
+  - 数值列用 TRY_CAST，空串/NaN 归一为 NULL
+- 元数据：`PRAGMA table_info` 可用；表清单用 `duckdb_tables()`，主键用 `duckdb_constraints()`。
+- 空间回收用 `CHECKPOINT`（`VACUUM` 不回收）；彻底压实用 EXPORT/IMPORT 重写。
+- `ALTER TABLE ADD COLUMN` 不支持带约束，迁移仅补可空列。
+- 遗留 SQLite 文件由 `scripts/migrate_sqlite_to_duckdb.py` 一次性迁移（源库只读附加）。
 
 ---
 
@@ -178,11 +200,12 @@ python scripts/generate_schema.py
 | `database/etl.py` | `REGISTRY` 列表注入 |
 
 DDL 生成规则：
-- 类型映射：str/None/datetime → TEXT，float → REAL，int → INTEGER
+- 类型映射：str/None/datetime → VARCHAR，float → DOUBLE，int → BIGINT
 - 主键推断：`_project.pk_override` 优先 > `ts_code+trade_date` > `ts_code+ann_date` > `trade_date` > `ts_code` > 无主键
-  （dividend 用 pk_override=`(ts_code, ann_date, div_proc)`：Tushare 同一事件多阶段行共享 ann_date）
-- `_project.upsert.null_pk_keep=true` 时保留主键为 NULL 的行（dividend 的 ann_date 可为空，
-  按 ts_code 拉取时这些实施/股东提议行才不丢）
+  （DuckDB 主键即 NOT NULL，SQLite 允许主键为 NULL 的旧行为不再成立）
+- dividend 的 ann_date 可为空 → `no_pk + partition_key=ts_code + dedupe_cols`，
+  按 ts_code 分区替换并批内去重，保住实施/股东提议等 NULL ann_date 行
+- `_project.upsert.null_pk_keep=true` 仅对 SQLite 遗留语义有意义，新库不再使用
 - SQL 保留字/数字开头/特殊字符自动加双引号
 - 基础设施表（`trade_cal`、`pull_log`）手写 DDL，不被覆盖
 
@@ -249,9 +272,9 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 
 ### 质检报告
 
-| 调用场景 | integrity_check | 行为 |
+| 调用场景 | 库大小/CHECKPOINT | 行为 |
 |---------|:---:|------|
-| `--verify` | ✅ | `PRAGMA integrity_check` + 覆盖率报告 |
+| `--verify` | - | 只读 `PRAGMA database_size` + 覆盖率报告（不写库） |
 | 建库 / --daily 末尾 | ❌ | 仅覆盖率报告 |
 
 覆盖分析：交易日历基准对齐 `backfill_since`。domain 表按 `date_mode` 聚合。大缺口 >100 天标注为可能 Tushare 断供。
@@ -260,12 +283,12 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 
 ## Qlib 数据转换
 
-`scripts/convert_to_qlib.py`（瘦 CLI）→ `qlib_export/`（8 文件），将 market.db 转换为 Qlib 二进制格式。
+`scripts/convert_to_qlib.py`（瘦 CLI）→ `qlib_export/`（8 文件），将 market.duckdb 转换为 Qlib 二进制格式。
 
 ### 架构
 
 ```
-market.db (SQLite)
+market.duckdb (DuckDB)
   │
   ├─ CalendarSync            → calendars/day.txt
   ├─ InstrumentSync          → instruments/all.txt（含退市股）
@@ -294,15 +317,15 @@ market.db (SQLite)
 
 ```sql
 CREATE TABLE bin_sync_log (
-    instrument    TEXT NOT NULL,
-    source_table  TEXT NOT NULL,
-    last_date     TEXT NOT NULL,
-    first_date    TEXT NOT NULL DEFAULT '',
-    fields_json   TEXT NOT NULL,
-    row_count     INTEGER,
-    status        TEXT DEFAULT 'done',   -- done / partial / error
-    error_msg     TEXT,
-    updated_at    TEXT,
+    instrument    VARCHAR NOT NULL,
+    source_table  VARCHAR NOT NULL,
+    last_date     VARCHAR NOT NULL,
+    first_date    VARCHAR NOT NULL DEFAULT '',
+    fields_json   VARCHAR NOT NULL,
+    row_count     BIGINT,
+    status        VARCHAR DEFAULT 'done',   -- done / partial / error
+    error_msg     VARCHAR,
+    updated_at    VARCHAR,
     PRIMARY KEY (instrument, source_table)
 );
 ```
@@ -318,11 +341,11 @@ CREATE TABLE bin_sync_log (
 
 ```sql
 CREATE TABLE pull_log (
-    table_name  TEXT NOT NULL,
-    date_val    TEXT NOT NULL,
-    ok          INTEGER NOT NULL,   -- 0=失败需重试, 1=成功, 2=确认空, 3=超限放弃
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    last_try    TEXT DEFAULT NULL,
+    table_name  VARCHAR NOT NULL,
+    date_val    VARCHAR NOT NULL,
+    ok          BIGINT NOT NULL,   -- 0=失败需重试, 1=成功, 2=确认空, 3=超限放弃
+    retry_count BIGINT NOT NULL DEFAULT 0,
+    last_try    VARCHAR DEFAULT NULL,
     PRIMARY KEY (table_name, date_val)
 );
 ```
@@ -363,9 +386,11 @@ tests/test_maintain_review.py — maintain 审查回归（策略矩阵、分区�
 tests/test_qlib_review.py     — qlib_export 审查回归（bin 格式、增量检测、中断续转、字段重建）
 tests/test_schema_gen_review.py — schema 生成链审查回归（分级、主键推断、保留字、REGISTRY 注入）
 tests/test_config_review.py   — 配置与辅助脚本审查回归（模板键一致性、派生表原子替换）
+tests/test_duckdb_review.py   — DuckDB 引擎回归（Row/Result/锁/事务/可空主键/TryCast/元数据）
+tests/test_migrate_review.py  — 迁移脚本回归（进度隔离、完成判定、原子写）
 ```
 
-261 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
+308 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
 
 ---
 

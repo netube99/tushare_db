@@ -1,12 +1,13 @@
 """全量特征转换引擎 — FeatureSync（全量转换 + 中断续转）."""
 
 import numpy as np
-import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+from database.engine import Connection
 from qlib_export.specs import _collect_tushare_cols
-from qlib_export.sync_log import is_synced, upsert_sync_log, get_partial_records
+from qlib_export.sync_log import (load_synced_fields, upsert_sync_log,
+                                  get_partial_records)
 from qlib_export.binio import write_bin
 from qlib_export.instruments import get_instruments_for_table, qlib_to_ts_code
 from qlib_export.calendar import CalendarSync
@@ -15,7 +16,7 @@ from qlib_export.calendar import CalendarSync
 class FeatureSync:
     """全量转换引擎，支持中断续转."""
 
-    def __init__(self, output_dir: Path, calendar: CalendarSync, conn: sqlite3.Connection,
+    def __init__(self, output_dir: Path, calendar: CalendarSync, conn: Connection,
                  since: str | None = None):
         self.output_dir = output_dir
         self.calendar = calendar
@@ -39,12 +40,14 @@ class FeatureSync:
             source_table = table_cfg["source_table"]
             instruments = get_instruments_for_table(self.conn, table_cfg)
             field_names = [f["bin_name"] for f in table_cfg["fields"]]
+            desired = set(field_names)
+            synced_map = load_synced_fields(self.conn, source_table)
 
             n_total = len(instruments)
             for i, inst in enumerate(instruments):
                 total_instruments += 1
                 overall_done += 1
-                if is_synced(self.conn, inst, source_table, field_names):
+                if desired.issubset(synced_map.get(inst, set())):
                     total_skipped += 1
                     continue
 
@@ -54,9 +57,8 @@ class FeatureSync:
                                 fields=field_names)
 
                 try:
-                    row_count = self._convert_instrument(inst, table_cfg)
-                    last_date = self._get_date_bound(inst, table_cfg, "MAX")
-                    first_date = self._get_date_bound(inst, table_cfg, "MIN")
+                    row_count, first_date, last_date = self._convert_instrument(
+                        inst, table_cfg)
 
                     upsert_sync_log(self.conn, inst, source_table,
                                     status="done", last_date=last_date,
@@ -89,19 +91,24 @@ class FeatureSync:
         }
 
     def _convert_instrument(self, inst: str, table_cfg: dict,
-                            since: str | None = None) -> int:
+                            since: str | None = None) -> tuple[int, str, str]:
         """转换单个 instrument 的一张表的所有字段.
 
         since 为 None 时取 self.since；传 "" 则不做日期过滤（新 instrument 全量首转）.
+        Returns: (row_count, first_date, last_date)，日期取自已拉取的排好序行，
+        省去每 instrument 两次 MIN/MAX 全表扫描。
         """
         fields = table_cfg["fields"]
 
         rows, col_names = self._query_instrument(inst, table_cfg, since=since)
 
         if not rows:
-            return 0
+            return 0, "", ""
 
         raw_count = len(rows)
+        date_idx = col_names.index(table_cfg["date_col"])
+        first_date = str(rows[0][date_idx] or "")
+        last_date = str(rows[-1][date_idx] or "")
 
         arrays = self._rows_to_arrays(rows, col_names, table_cfg, fields)
 
@@ -113,7 +120,7 @@ class FeatureSync:
             bin_path = inst_dir / f"{field_name}.day.bin"
             write_bin(bin_path, arrays[j])
 
-        return raw_count
+        return raw_count, first_date, last_date
 
     def _inst_where(self, table_cfg: dict, inst: str,
                     date_cond: tuple[str, str] | None = None) -> tuple[str, tuple]:

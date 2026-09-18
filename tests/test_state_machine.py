@@ -1,13 +1,10 @@
 """A5-2: 状态机单测 — upsert_df (pk NaN 过滤/列过滤) + log_pull ok 流转."""
 
-import sqlite3
-import tempfile
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
 
+from database.engine import connect
 from database.utils import upsert_df
 from database.etl import log_pull
 
@@ -16,12 +13,8 @@ from database.etl import log_pull
 
 @pytest.fixture
 def conn():
-    """内存数据库，含测试表."""
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=10000")
-    return db
+    """DuckDB 内存数据库，含测试表."""
+    return connect(":memory:")
 
 
 def _ensure_table(conn, table, ddl):
@@ -32,13 +25,13 @@ def _ensure_table(conn, table, ddl):
 # ── upsert_df ──
 
 def test_upsert_empty_df(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT PRIMARY KEY, val REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR PRIMARY KEY, val DOUBLE)')
     df = pd.DataFrame()
     assert upsert_df(conn, "test", df) == 0
 
 
 def test_upsert_basic_insert(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT PRIMARY KEY, val REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR PRIMARY KEY, val DOUBLE)')
     df = pd.DataFrame({"ts_code": ["A", "B"], "val": [1.0, 2.0]})
     n = upsert_df(conn, "test", df)
     assert n == 2
@@ -48,7 +41,7 @@ def test_upsert_basic_insert(conn):
 
 
 def test_upsert_replace_on_conflict(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT, trade_date TEXT, val REAL, PRIMARY KEY (ts_code, trade_date))')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR, trade_date VARCHAR, val DOUBLE, PRIMARY KEY (ts_code, trade_date))')
     df1 = pd.DataFrame({"ts_code": ["A", "A"], "trade_date": ["20200101", "20200102"], "val": [1.0, 2.0]})
     upsert_df(conn, "test", df1)
     df2 = pd.DataFrame({"ts_code": ["A"], "trade_date": ["20200101"], "val": [99.0]})
@@ -60,7 +53,7 @@ def test_upsert_replace_on_conflict(conn):
 
 
 def test_upsert_drop_nan_pk(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT, trade_date TEXT, val REAL, PRIMARY KEY (ts_code, trade_date))')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR, trade_date VARCHAR, val DOUBLE, PRIMARY KEY (ts_code, trade_date))')
     df = pd.DataFrame({
         "ts_code": ["A", None, "C"],
         "trade_date": ["20200101", "20200102", "20200103"],
@@ -73,7 +66,7 @@ def test_upsert_drop_nan_pk(conn):
 
 
 def test_upsert_drop_all_nan_row(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT PRIMARY KEY, val REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR PRIMARY KEY, val DOUBLE)')
     df = pd.DataFrame({"ts_code": ["A", "B"], "val": [1.0, np.nan]})
     df.loc[1] = [np.nan, np.nan]  # row 1: both NaN → dropna(how="all") drops it
     # remaining: row 0 (A, 1.0), row 1 (B, NaN) → pk filter drops B/NaN row
@@ -82,7 +75,7 @@ def test_upsert_drop_all_nan_row(conn):
 
 
 def test_upsert_filter_unknown_columns(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT PRIMARY KEY, val REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR PRIMARY KEY, val DOUBLE)')
     df = pd.DataFrame({"ts_code": ["A"], "val": [1.0], "extra_col": [999]})
     n = upsert_df(conn, "test", df)
     assert n == 1
@@ -91,7 +84,7 @@ def test_upsert_filter_unknown_columns(conn):
 
 
 def test_upsert_no_pk_table(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (name TEXT, value REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (name VARCHAR, value DOUBLE)')
     df1 = pd.DataFrame({"name": ["A", "B"], "value": [1.0, 2.0]})
     upsert_df(conn, "test", df1)
     df2 = pd.DataFrame({"name": ["C"], "value": [3.0]})
@@ -101,8 +94,18 @@ def test_upsert_no_pk_table(conn):
     assert rows[0]["name"] == "C"
 
 
+def test_upsert_dropped_columns_warn(conn, caplog):
+    _ensure_table(
+        conn, "drop_warn",
+        "CREATE TABLE drop_warn (ts_code VARCHAR PRIMARY KEY, val DOUBLE)")
+    df = pd.DataFrame({"ts_code": ["A"], "val": [1.0], "new_field": ["x"]})
+    with caplog.at_level("WARNING", logger="database.utils"):
+        assert upsert_df(conn, "drop_warn", df) == 1
+    assert any("new_field" in r.message for r in caplog.records)
+
+
 def test_upsert_all_nan_after_dropna(conn):
-    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code TEXT PRIMARY KEY, val REAL)')
+    _ensure_table(conn, "test", 'CREATE TABLE test (ts_code VARCHAR PRIMARY KEY, val DOUBLE)')
     df = pd.DataFrame({"ts_code": [np.nan], "val": [np.nan]})
     n = upsert_df(conn, "test", df)
     assert n == 0
@@ -113,11 +116,11 @@ def test_upsert_all_nan_after_dropna(conn):
 def _init_pull_log(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pull_log (
-            table_name TEXT NOT NULL,
-            date_val   TEXT NOT NULL,
-            ok         INTEGER NOT NULL,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            last_try   TEXT DEFAULT NULL,
+            table_name VARCHAR NOT NULL,
+            date_val   VARCHAR NOT NULL,
+            ok         BIGINT NOT NULL,
+            retry_count BIGINT NOT NULL DEFAULT 0,
+            last_try   VARCHAR DEFAULT NULL,
             PRIMARY KEY (table_name, date_val)
         )
     """)
@@ -184,7 +187,7 @@ def test_log_pull_last_try_updated(conn):
     ).fetchone()
     assert row1["last_try"] is not None
     import time
-    time.sleep(1.1)  # ensure datetime('now','localtime') ticks to next second
+    time.sleep(1.1)  # 保证 last_try 秒级时间戳变化
     log_pull(conn, "test_table", "20200101", 1, api="daily")
     row2 = conn.execute(
         "SELECT last_try FROM pull_log WHERE table_name='test_table'"

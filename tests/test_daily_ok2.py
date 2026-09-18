@@ -5,26 +5,26 @@
 用 trade_date 策略表 stk_factor_pro 作为被测对象（dividend 已转 domain 策略）.
 """
 
-import sqlite3
 from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
 
 import scripts.maintain as m
+from database.engine import connect
 from database.etl import REGISTRY
 
 
 @pytest.fixture
 def scratch(monkeypatch):
     """内存库 + 仅 stk_factor_pro 的 REGISTRY + 记录调用的 FakeDC."""
-    conn = sqlite3.connect(":memory:")
+    conn = connect(":memory:")
     conn.execute(
-        "CREATE TABLE pull_log (table_name TEXT NOT NULL, date_val TEXT NOT NULL, "
-        "ok INTEGER NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, "
-        "last_try TEXT DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
-    conn.execute("CREATE TABLE trade_cal (cal_date TEXT, exchange TEXT, is_open INTEGER)")
-    conn.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT)")
+        "CREATE TABLE pull_log (table_name VARCHAR NOT NULL, date_val VARCHAR NOT NULL, "
+        "ok BIGINT NOT NULL, retry_count BIGINT NOT NULL DEFAULT 0, "
+        "last_try VARCHAR DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
+    conn.execute("CREATE TABLE trade_cal (cal_date VARCHAR, exchange VARCHAR, is_open BIGINT)")
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
 
     entry = next(e for e in REGISTRY if e["table"] == "stk_factor_pro")
     monkeypatch.setattr(m, "REGISTRY", [entry])
@@ -108,14 +108,14 @@ def test_daily_ok2_deletion_never_loses_rows(scratch):
 def test_daily_domain_once_refreshes_new_domain_values(monkeypatch):
     """domain-once 表（dividend）：daily 直接逐域 dispatch，
     已拉域值（ok=1/2）跳过，未拉域值补齐 — 新股分红不被 MAX(date_col) 门禁遗漏."""
-    conn = sqlite3.connect(":memory:")
+    conn = connect(":memory:")
     conn.execute(
-        "CREATE TABLE pull_log (table_name TEXT NOT NULL, date_val TEXT NOT NULL, "
-        "ok INTEGER NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, "
-        "last_try TEXT DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
-    conn.execute("CREATE TABLE trade_cal (cal_date TEXT, exchange TEXT, is_open INTEGER)")
-    conn.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT)")
-    conn.execute("CREATE TABLE dividend (ts_code TEXT, ann_date TEXT, div_proc TEXT)")
+        "CREATE TABLE pull_log (table_name VARCHAR NOT NULL, date_val VARCHAR NOT NULL, "
+        "ok BIGINT NOT NULL, retry_count BIGINT NOT NULL DEFAULT 0, "
+        "last_try VARCHAR DEFAULT NULL, PRIMARY KEY (table_name, date_val))")
+    conn.execute("CREATE TABLE trade_cal (cal_date VARCHAR, exchange VARCHAR, is_open BIGINT)")
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE dividend (ts_code VARCHAR, ann_date VARCHAR, div_proc VARCHAR)")
     conn.executemany("INSERT INTO stk_factor_pro (ts_code) VALUES (?)",
                      [("000001.SZ",), ("000002.SZ",), ("000003.SZ",)])
     conn.execute("INSERT INTO pull_log VALUES ('dividend','000001.SZ__once__',1,0,?)",

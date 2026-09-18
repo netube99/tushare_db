@@ -1,10 +1,9 @@
 """qlib_export 审查测试 — TDD 证实/证伪疑似缺陷 + 守护回归."""
 
-import sqlite3
-
 import numpy as np
 import pytest
 
+from database.engine import connect
 from qlib_export import (
     init_sync_log,
     CalendarSync,
@@ -42,20 +41,19 @@ def _stub_logger(monkeypatch):
 
 @pytest.fixture
 def conn():
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    db.execute("CREATE TABLE trade_cal (exchange TEXT, cal_date TEXT, is_open INTEGER)")
+    db = connect(":memory:")
+    db.execute("CREATE TABLE trade_cal (exchange VARCHAR, cal_date VARCHAR, is_open BIGINT)")
     for d in CAL:
         db.execute("INSERT INTO trade_cal VALUES ('SSE', ?, 1)", (d,))
-    db.execute("CREATE TABLE stock_basic (ts_code TEXT, list_date TEXT, delist_date TEXT)")
+    db.execute("CREATE TABLE stock_basic (ts_code VARCHAR, list_date VARCHAR, delist_date VARCHAR)")
     db.execute("INSERT INTO stock_basic VALUES ('000001.SZ', '19910403', NULL)")
     for tbl in ("etf_basic", "index_basic", "cb_basic"):
-        db.execute(f"CREATE TABLE {tbl} (ts_code TEXT, list_date TEXT)")
-    db.execute("CREATE TABLE sw_daily (ts_code TEXT, trade_date TEXT)")
-    db.execute("CREATE TABLE gz_index (date TEXT)")
-    db.execute("CREATE TABLE margin (exchange_id TEXT, trade_date TEXT)")
-    db.execute("CREATE TABLE moneyflow_hsgt (trade_date TEXT)")
-    db.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT)")
+        db.execute(f"CREATE TABLE {tbl} (ts_code VARCHAR, list_date VARCHAR)")
+    db.execute("CREATE TABLE sw_daily (ts_code VARCHAR, trade_date VARCHAR)")
+    db.execute("CREATE TABLE gz_index (date VARCHAR)")
+    db.execute("CREATE TABLE margin (exchange_id VARCHAR, trade_date VARCHAR)")
+    db.execute("CREATE TABLE moneyflow_hsgt (trade_date VARCHAR)")
+    db.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
     init_sync_log(db)
     return db
 
@@ -120,12 +118,15 @@ def test_append_bin_missing_file_degrades_to_write(tmp_path):
     np.testing.assert_array_equal(data[1:], np.array([1.0, np.nan, 2.0], dtype=np.float32))
 
 
-def test_append_bin_corrupt_rebuilds(tmp_path):
+def test_append_bin_corrupt_raises_and_preserves_file(tmp_path):
+    from qlib_export.binio import CorruptBinError
+
     p = tmp_path / "f.day.bin"
     p.write_bytes(b"\x00\x01\x02")
     new = np.array([1.0, 2.0], dtype=np.float32)
-    assert append_bin(p, new) is True
-    np.testing.assert_array_equal(read_bin(p)[1:], np.array([1.0, 2.0], dtype=np.float32))
+    with pytest.raises(CorruptBinError):
+        append_bin(p, new)
+    assert p.read_bytes() == b"\x00\x01\x02"
 
 
 def test_append_bin_overlap_is_append_only(tmp_path):
@@ -233,25 +234,26 @@ def test_delisted_stock_in_all_txt(conn, tmp_path):
 def test_init_sync_log_schema_matches_contract(conn):
     cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(bin_sync_log)").fetchall()}
     expected = {
-        "instrument": "TEXT",
-        "source_table": "TEXT",
-        "last_date": "TEXT",
-        "first_date": "TEXT",
-        "fields_json": "TEXT",
-        "row_count": "INTEGER",
-        "status": "TEXT",
-        "error_msg": "TEXT",
-        "updated_at": "TEXT",
+        "instrument": "VARCHAR",
+        "source_table": "VARCHAR",
+        "last_date": "VARCHAR",
+        "first_date": "VARCHAR",
+        "fields_json": "VARCHAR",
+        "row_count": "BIGINT",
+        "status": "VARCHAR",
+        "error_msg": "VARCHAR",
+        "updated_at": "VARCHAR",
     }
     assert set(cols) == set(expected)
     for name, typ in expected.items():
         assert cols[name]["type"] == typ
     assert cols["first_date"]["dflt_value"] == "''"
     assert cols["status"]["dflt_value"] == "'done'"
-    ddl = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bin_sync_log'"
+    pk_cols = conn.execute(
+        "SELECT constraint_column_names FROM duckdb_constraints() "
+        "WHERE table_name='bin_sync_log' AND constraint_type='PRIMARY KEY'"
     ).fetchone()[0]
-    assert "PRIMARY KEY (instrument, source_table)" in ddl
+    assert list(pk_cols) == ["instrument", "source_table"]
 
 
 def test_is_synced_field_subset(conn):
@@ -272,7 +274,7 @@ def test_get_partial_records_filter(conn):
 
 
 def _make_table(conn, name, date_col, extra_cols):
-    cols = ", ".join(["ts_code TEXT", f"{date_col} TEXT"] + [f"{c} REAL" for c in extra_cols])
+    cols = ", ".join(["ts_code VARCHAR", f"{date_col} VARCHAR"] + [f"{c} DOUBLE" for c in extra_cols])
     conn.execute(f"CREATE TABLE {name} ({cols})")
 
 
@@ -346,7 +348,7 @@ def test_agg_sum_count_weighted(conn, calendar, tmp_path):
 
 
 def test_encoding_st_and_unknown(conn, calendar, tmp_path):
-    conn.execute("CREATE TABLE t_st (ts_code TEXT, trade_date TEXT, type TEXT)")
+    conn.execute("CREATE TABLE t_st (ts_code VARCHAR, trade_date VARCHAR, type VARCHAR)")
     conn.execute("INSERT INTO t_st VALUES ('000001.SZ', '20260615', 'ST')")
     conn.execute("INSERT INTO t_st VALUES ('000001.SZ', '20260616', 'P')")
     conn.commit()
@@ -427,6 +429,30 @@ def test_daily_append_ann_date_collision(conn, calendar, tmp_path):
     stats = inc.daily_sync([cfg], quiet=True)
     assert stats["updated_records"] == 1
     np.testing.assert_allclose(read_bin(bin_path)[1:], [2.0])
+
+
+def test_daily_corrupt_bin_triggers_full_reconvert_keeps_history(conn, calendar, tmp_path):
+    _make_table(conn, "t_corrupt", "trade_date", ["val"])
+    conn.execute("INSERT INTO t_corrupt VALUES ('000001.SZ', '20260615', 1.0)")
+    conn.execute("INSERT INTO t_corrupt VALUES ('000001.SZ', '20260617', 3.0)")
+    conn.commit()
+    cfg = {
+        "source_table": "t_corrupt", "inst_col": "ts_code", "date_col": "trade_date",
+        "inst_type": "stock",
+        "fields": [{"bin_name": "tc_val", "tushare_col": "val"}],
+    }
+    fs, inc = _full_sync(conn, calendar, tmp_path, cfg)
+    bin_path = tmp_path / "features" / "sz000001" / "tc_val.day.bin"
+    np.testing.assert_allclose(read_bin(bin_path)[1:], [1.0, np.nan, 3.0], equal_nan=True)
+
+    conn.execute("INSERT INTO t_corrupt VALUES ('000001.SZ', '20260622', 5.0)")
+    conn.commit()
+    bin_path.write_bytes(b"\x00\x01\x02")
+
+    stats = inc.daily_sync([cfg], quiet=True)
+    assert stats["updated_records"] == 1
+    np.testing.assert_allclose(read_bin(bin_path)[1:], [1.0, np.nan, 3.0, 5.0],
+                               equal_nan=True)
 
 
 def test_daily_midfill_detection_for_agg_table(conn, calendar, tmp_path):
@@ -593,9 +619,8 @@ def test_rebuild_fields_unknown_field_is_noop(conn, calendar, tmp_path):
 def test_build_field_map_skips_missing_tables():
     from qlib_export.specs import build_field_map
 
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    db.execute("CREATE TABLE stk_factor_pro (ts_code TEXT, trade_date TEXT, open_hfq REAL)")
+    db = connect(":memory:")
+    db.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR, open_hfq DOUBLE)")
     tables = build_field_map(db)
     names = {t["source_table"] for t in tables}
     assert "stk_factor_pro" in names
@@ -606,8 +631,7 @@ def test_build_field_map_skips_missing_tables():
 def test_get_instruments_for_table_missing_source(tmp_path):
     from qlib_export.instruments import get_instruments_for_table
 
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
+    db = connect(":memory:")
     cfg = {"inst_type": "etf", "inst_col": "ts_code", "date_col": "trade_date"}
     assert get_instruments_for_table(db, cfg) == []
 

@@ -2,25 +2,32 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-import sqlite3
+import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 import yaml
 
+logger = logging.getLogger(__name__)
+
+from database import engine
+from database.engine import Connection
 from database.schema import load_schema_sql
 
 # 项目根目录，所有默认路径相对此处解析
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = engine.PROJECT_ROOT
 
 # 北京时间时区
 _CST = ZoneInfo("Asia/Shanghai")
 
 # api_index.json 内存缓存
 _registry_cache: list[dict] | None = None
+
+# 已告警过的 (表, 被丢弃列)：避免每次拉取重复刷日志
+_dropped_warned: set[tuple[str, tuple[str, ...]]] = set()
 
 
 def beijing_now() -> datetime:
@@ -49,46 +56,193 @@ def beijing_today() -> date:
     return beijing_now().date()
 
 
-def init_schema(conn: sqlite3.Connection) -> None:
+def init_schema(conn: Connection) -> None:
     """初始化数据库表结构（幂等，CREATE IF NOT EXISTS，每次调用读取最新 schema.sql）."""
     schema_sql = load_schema_sql()
     if not schema_sql.strip():
         raise RuntimeError(
             "database/schema.sql 缺失或为空，请先运行 scripts/generate_schema.py 生成"
         )
-    conn.executescript(schema_sql)
-    # 迁移：为已有 pull_log 表添加新列
-    for col, col_def in [
-        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
-        ("last_try", "TEXT DEFAULT NULL"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE pull_log ADD COLUMN {col} {col_def}")
-        except sqlite3.OperationalError:
-            pass
+    engine.execute_script(conn, schema_sql)
+    _sync_columns(conn, schema_sql)
     conn.commit()
 
 
-def get_conn(db_path: str | None = None) -> sqlite3.Connection:
-    """获取数据库连接，自动启用 WAL 并初始化 schema.
+_COLUMN_RE = re.compile(
+    r'^\s{4}(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s+'
+    r'([A-Za-z][A-Za-z0-9_]*(?:\s*\([^)]*\))?)(.*?),?\s*$')
+_DEFAULT_RE = re.compile(r"DEFAULT\s+('[^']*'|[^\s,]+)", re.IGNORECASE)
 
-    check_same_thread=False: SQLite 连接可在多线程间共享（Python GIL 保证
-    execute 原子性，WAL 模式下读写不互斥）。上层调用方自行确保不在同一连接
-    上并发执行。
 
-    Args:
-        db_path: 数据库文件路径。None 则使用项目默认路径，":memory:" 为内存库。
+def _sync_columns(conn: Connection, schema_sql: str) -> None:
+    """按当前 schema.sql 为已存在表补新列（DuckDB ADD COLUMN 不接受约束）.
+
+    生成器只在表不存在时 CREATE；接口新增字段后已有表需要这里补列，
+    否则 upsert_df 会静默丢弃该列的数据。补列后按 DDL 恢复 DEFAULT/NOT NULL。
+    """
+    for block in re.finditer(
+            r'CREATE TABLE IF NOT EXISTS (?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*)) '
+            r'\((.*?)\n\);', schema_sql, re.S):
+        table, body = block.group(1) or block.group(2), block.group(3)
+        existing = engine.table_columns(conn, table)
+        if not existing:
+            continue
+        for line in body.splitlines():
+            upper = line.strip().upper()
+            if upper.startswith(("PRIMARY KEY", "UNIQUE", "CHECK", "CONSTRAINT")):
+                continue
+            m = _COLUMN_RE.match(line)
+            if m is None:
+                continue
+            name = m.group(1) or m.group(2)
+            if name in existing:
+                continue
+            col_type, rest = m.group(3), m.group(4) or ""
+            qt, qc = engine._quote_ident(table), engine._quote_ident(name)
+            conn.execute(f"ALTER TABLE {qt} ADD COLUMN {qc} {col_type}")
+            dm = _DEFAULT_RE.search(rest)
+            default = dm.group(1) if dm else None
+            if default is not None and default.upper() != "NULL":
+                conn.execute(f"UPDATE {qt} SET {qc} = {default} WHERE {qc} IS NULL")
+                conn.execute(f"ALTER TABLE {qt} ALTER COLUMN {qc} SET DEFAULT {default}")
+            if "NOT NULL" in upper and default is not None:
+                conn.execute(f"ALTER TABLE {qt} ALTER COLUMN {qc} SET NOT NULL")
+
+
+def get_conn(db_path: str | None = None, read_only: bool = False) -> Connection:
+    """获取 DuckDB 连接并初始化 schema.
+
+    db_path: 数据库文件路径。None 则使用 data/market.duckdb，":memory:" 为内存库。
+    read_only: 只读连接不执行 DDL（用于 convert/verify 等读者）。
+    文件库为单写者模型，跨进程并发需配合 engine.db_lock。
     """
     if db_path is None:
-        db_path = os.path.join(PROJECT_ROOT, "data", "market.db")
-    if db_path != ":memory:":
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
-    init_schema(conn)
+        db_path = engine.DEFAULT_DB_PATH
+    try:
+        config = load_config()
+    except (FileNotFoundError, yaml.YAMLError):
+        config = {}
+    conn = engine.connect(
+        db_path,
+        read_only=read_only,
+        threads=config.get("duckdb_threads"),
+        memory_limit=config.get("duckdb_memory_limit"),
+        checkpoint_threshold=config.get("duckdb_checkpoint_threshold"),
+    )
+    if not read_only:
+        init_schema(conn)
     return conn
+
+
+def upsert_df(conn: Connection, table: str, df: pd.DataFrame,
+              drop_null_pk: bool = True, replace_all: bool = True,
+              conflict_cols: list[str] | None = None,
+              dedupe_cols: list[str] | None = None,
+              pre_delete: tuple[str, list] | None = None) -> int:
+    """将 DataFrame 写入 DuckDB 表（DELETE/INSERT 同事务，失败整体回滚）.
+
+    drop_null_pk: 丢弃主键/冲突列为 NULL 的行（DuckDB 主键 NOT NULL，NULL 会
+    直接报错）。仅作用于有 PK/UNIQUE 冲突目标的表；dedupe_cols 允许 NULL。
+    replace_all: 无冲突目标表默认整表替换（once 快照表适用）；分区替换场景
+    （partition_key，如 pledge_detail）配合 pre_delete 置 False。
+    conflict_cols: 显式 SQL 冲突列；缺省用表主键。
+    dedupe_cols: 仅做批内去重（keep=last），用于无约束表。
+    pre_delete: (列, 值列表)，先删目标分区再插入，保证幂等与原子性。
+    """
+    df = df.dropna(how="all")
+    if df.empty:
+        return 0
+
+    table_cols = engine.table_columns(conn, table)
+    if not table_cols:
+        raise ValueError(f"upsert_df: 表 {table} 不存在")
+    valid_cols = [c for c in df.columns if c in table_cols]
+    if not valid_cols:
+        raise ValueError(
+            f"upsert_df: DataFrame 列 {list(df.columns)} 与表 {table} 列完全不匹配"
+        )
+    dropped = [c for c in df.columns if c not in table_cols]
+    if dropped:
+        key = (table, tuple(sorted(dropped)))
+        if key not in _dropped_warned:
+            _dropped_warned.add(key)
+            logger.warning(
+                f"upsert_df: 表 {table} 不存在列 {dropped}，已丢弃；"
+                f"若为新增字段请先运行 scripts/generate_schema.py + init_schema")
+    df = df[valid_cols]
+
+    conflict = list(conflict_cols) if conflict_cols else engine.primary_key_cols(conn, table)
+
+    if conflict:
+        missing_pk = set(conflict) - set(df.columns)
+        if missing_pk:
+            raise ValueError(f"upsert_df: 表 {table} 主键列 {sorted(missing_pk)} 不在 DataFrame 中")
+        if drop_null_pk:
+            df = df.dropna(subset=conflict)
+        # DuckDB 批内重复键保留首行；SQLite REPLACE 为 last-wins，入库前去重对齐
+        df = df.drop_duplicates(subset=conflict, keep="last")
+    elif dedupe_cols:
+        missing = set(dedupe_cols) - set(df.columns)
+        if missing:
+            raise ValueError(f"upsert_df: 表 {table} 去重列 {sorted(missing)} 不在 DataFrame 中")
+        df = df.drop_duplicates(subset=dedupe_cols, keep="last")
+
+    if df.empty:
+        return 0
+
+    col_sql = ", ".join(engine._quote_ident(c) for c in df.columns)
+    select_sql = ", ".join(_cast_expr(c, table_cols[c]["type"]) for c in df.columns)
+    verb = "INSERT OR REPLACE INTO" if conflict else "INSERT INTO"
+    quoted_table = engine._quote_ident(table)
+
+    conn.register("_incoming_df", df)
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        if pre_delete is not None:
+            col, values = pre_delete
+            conn.execute(
+                f'DELETE FROM {quoted_table} '
+                f'WHERE {engine._quote_ident(col)} IN (SELECT unnest(?))',
+                [list(values)],
+            )
+        elif not conflict and replace_all:
+            conn.execute(f"DELETE FROM {quoted_table}")
+        conn.execute(
+            f'{verb} {quoted_table} ({col_sql}) '
+            f"SELECT {select_sql} FROM _incoming_df"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.unregister("_incoming_df")
+    return len(df)
+
+
+def _cast_expr(col: str, col_type: str) -> str:
+    """生成写入表达式：VARCHAR 用 CAST，数值/时间用 TRY_CAST 宽容空串/NaN."""
+    quoted = engine._quote_ident(col)
+    if str(col_type).upper().startswith("VARCHAR"):
+        return f"CAST({quoted} AS VARCHAR)"
+    return f"TRY_CAST({quoted} AS {col_type})"
+
+
+def load_api_registry() -> list[dict]:
+    """加载 api_index.json——项目配置的唯一真相源."""
+    global _registry_cache
+    if _registry_cache is not None:
+        return _registry_cache
+    path = os.path.join(PROJECT_ROOT, "api_index.json")
+    with open(path) as f:
+        _registry_cache = json.load(f)
+    return _registry_cache
+
+
+def invalidate_registry_cache() -> None:
+    """api_index.json 被外部修改（如 classify_apis.py）后使缓存失效."""
+    global _registry_cache
+    _registry_cache = None
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -111,101 +265,8 @@ def load_config(config_path: str | None = None) -> dict:
         raise yaml.YAMLError(f"配置文件 YAML 解析错误: {config_path}\n{e}") from e
 
 
-def upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame,
-              drop_null_pk: bool = True, replace_all: bool = True) -> int:
-    """将 DataFrame 写入 SQLite 表，主键冲突时 REPLACE.
-
-    drop_null_pk: 丢弃主键列为 NULL 的行。默认 True（NULL pk 不触发 REPLACE
-    会堆积重复行）；个别表（如 dividend，ann_date 可为空）置 False 保留。
-    replace_all: 无主键表默认整表替换（once 快照表适用）；分区替换场景
-    （partition_key，如 pledge_detail）置 False，仅 INSERT 不删除。
-    """
-    df = df.dropna(how="all")
-    if df.empty:
-        return 0
-
-    # 只保留表中存在的列（过滤 Tushare 未文档化的字段）
-    table_info = conn.execute(f'PRAGMA table_info({_quote_ident(table)})').fetchall()
-    table_cols = {row[1] for row in table_info}
-    pk_cols = {row[1] for row in table_info if row[5]}  # row[5] = pk flag
-    valid_cols = [c for c in df.columns if c in table_cols]
-    if not valid_cols:
-        raise ValueError(
-            f"upsert_df: 表 {table} 不存在，或 DataFrame 列 {list(df.columns)} 与表列完全不匹配"
-        )
-    df = df[valid_cols]
-
-    # 主键列必须全部出现，否则 REPLACE 失效，行会以 NULL pk 无限堆积
-    missing_pk = pk_cols - set(df.columns)
-    if missing_pk:
-        raise ValueError(f"upsert_df: 表 {table} 主键列 {sorted(missing_pk)} 不在 DataFrame 中")
-
-    # 丢弃主键列为 NaN 的脏行（NULL pk 不触发 REPLACE，会堆积重复行）
-    if drop_null_pk and pk_cols:
-        df = df.dropna(subset=list(pk_cols))
-        if df.empty:
-            return 0
-
-    columns = df.columns.tolist()
-    placeholders = ", ".join(["?"] * len(columns))
-    cols_quoted = ", ".join(_quote_ident(c) for c in columns)
-    sql = f'INSERT OR REPLACE INTO {_quote_ident(table)} ({cols_quoted}) VALUES ({placeholders})'
-
-    # numpy 数值/布尔 dtype 经 itertuples 产出原生 Python 标量，可直绑；
-    # pandas 3 str dtype 同理（产出 str/nan）；其余（object/datetime64/nullable
-    # extension dtypes 等）逐值归一化，避免 np.int64/Timestamp/NaT/pd.NA 绑定失败
-    if all(isinstance(dt, np.dtype) and dt.kind in "ifbu"
-           or isinstance(dt, pd.StringDtype) for dt in df.dtypes):
-        rows = list(df.itertuples(index=False))
-    else:
-        rows = [tuple(_bind_value(v) for v in row) for row in df.itertuples(index=False)]
-    try:
-        # 无 pk 表：整表替换（仅剩 once 策略快照表适用）；与 INSERT 同事务，失败整体回滚
-        if not pk_cols and replace_all:
-            conn.execute(f'DELETE FROM {_quote_ident(table)}')
-        conn.executemany(sql, rows)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return len(rows)
-
-
-def _quote_ident(name: str) -> str:
-    """SQLite 标识符引用：双引号包裹，内嵌双引号转义为两个双引号."""
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def _bind_value(v):
-    """将 pandas/numpy 标量归一化为 sqlite3 可绑定类型.
-
-    np 标量 -> Python 标量；NaT/pd.NA -> None；Timestamp/datetime/date -> str
-    （等价于 SQLite TEXT affinity 与已废弃的 datetime adapter 行为，无告警）。
-    其余原样返回。
-    """
-    if v is None or isinstance(v, (bool, int, float, str, bytes)):
-        return v
-    if v is pd.NaT or v is pd.NA:
-        return None
-    if isinstance(v, (pd.Timestamp, datetime, date)):
-        return str(v)
-    if isinstance(v, np.generic):
-        return _bind_value(v.item())
-    return v
-
-
-def load_api_registry() -> list[dict]:
-    """加载 api_index.json——项目配置的唯一真相源."""
-    global _registry_cache
-    if _registry_cache is not None:
-        return _registry_cache
-    path = os.path.join(PROJECT_ROOT, "api_index.json")
-    with open(path) as f:
-        _registry_cache = json.load(f)
-    return _registry_cache
-
-
-def invalidate_registry_cache() -> None:
-    """api_index.json 被外部修改（如 classify_apis.py）后使缓存失效."""
-    global _registry_cache
-    _registry_cache = None
+__all__ = [
+    "PROJECT_ROOT", "Connection", "beijing_now", "beijing_today",
+    "atomic_write_text", "init_schema", "get_conn", "upsert_df",
+    "load_config", "load_api_registry", "invalidate_registry_cache",
+]

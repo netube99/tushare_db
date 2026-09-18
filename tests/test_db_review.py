@@ -2,7 +2,6 @@
 
 import json
 import os
-import sqlite3
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -12,6 +11,7 @@ import pandas as pd
 import pytest
 
 import database.utils as utils
+from database.engine import connect
 from database.utils import (
     PROJECT_ROOT,
     atomic_write_text,
@@ -29,11 +29,7 @@ from database.etl import log_pull
 
 @pytest.fixture
 def conn():
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=10000")
-    return db
+    return connect(":memory:")
 
 
 def _table(conn, ddl):
@@ -44,14 +40,14 @@ def _table(conn, ddl):
 # ── upsert_df: 表不存在 / 列完全不匹配 ──
 
 def test_upsert_missing_table_raises(conn):
-    _table(conn, "CREATE TABLE other (a TEXT)")
+    _table(conn, "CREATE TABLE other (a VARCHAR)")
     df = pd.DataFrame({"a": ["A"]})
     with pytest.raises(ValueError, match="nope"):
         upsert_df(conn, "nope", df)
 
 
 def test_upsert_all_columns_unknown_raises(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY)")
     df = pd.DataFrame({"x": ["A"], "y": ["B"]})
     with pytest.raises(ValueError, match="t"):
         upsert_df(conn, "t", df)
@@ -60,14 +56,14 @@ def test_upsert_all_columns_unknown_raises(conn):
 # ── upsert_df: 主键列整列缺失 ──
 
 def test_upsert_pk_column_missing_raises(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b VARCHAR)")
     df = pd.DataFrame({"b": ["x", "y"]})
     with pytest.raises(ValueError, match="主键"):
         upsert_df(conn, "t", df)
 
 
 def test_upsert_partial_pk_missing_raises(conn):
-    _table(conn, "CREATE TABLE t (a TEXT, b TEXT, val REAL, PRIMARY KEY (a, b))")
+    _table(conn, "CREATE TABLE t (a VARCHAR, b VARCHAR, val DOUBLE, PRIMARY KEY (a, b))")
     df = pd.DataFrame({"a": ["A"], "val": [1.0]})
     with pytest.raises(ValueError, match="主键"):
         upsert_df(conn, "t", df)
@@ -76,7 +72,7 @@ def test_upsert_partial_pk_missing_raises(conn):
 # ── upsert_df: 不可绑定标量（Timestamp/NaT/pd.NA/np 标量） ──
 
 def test_upsert_datetime64_column(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b VARCHAR)")
     df = pd.DataFrame({"a": pd.to_datetime(["2020-01-01"]), "b": ["x"]})
     n = upsert_df(conn, "t", df)
     assert n == 1
@@ -85,7 +81,7 @@ def test_upsert_datetime64_column(conn):
 
 
 def test_upsert_nat_in_datetime64_column(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b VARCHAR)")
     df = pd.DataFrame({"a": ["A", "B"], "b": pd.to_datetime(pd.Series(["2020-01-01", None]))})
     n = upsert_df(conn, "t", df)
     assert n == 2
@@ -95,7 +91,7 @@ def test_upsert_nat_in_datetime64_column(conn):
 
 
 def test_upsert_pd_na_object_column(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b VARCHAR)")
     df = pd.DataFrame({"a": ["A"], "b": pd.array([None], dtype="Int64").astype(object)})
     df.loc[0, "b"] = pd.NA
     n = upsert_df(conn, "t", df)
@@ -104,7 +100,7 @@ def test_upsert_pd_na_object_column(conn):
 
 
 def test_upsert_np_generic_in_object_column(conn):
-    _table(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b REAL)")
+    _table(conn, "CREATE TABLE t (a BIGINT PRIMARY KEY, b DOUBLE)")
     df = pd.DataFrame({"a": pd.Series([np.int64(1)], dtype=object),
                        "b": pd.Series([np.float64(1.5)], dtype=object)})
     n = upsert_df(conn, "t", df)
@@ -114,7 +110,7 @@ def test_upsert_np_generic_in_object_column(conn):
 
 
 def test_upsert_nullable_int64_with_na(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b INTEGER)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b BIGINT)")
     df = pd.DataFrame({"a": ["A"], "b": pd.array([None], dtype="Int64")})
     df.loc[0, "b"] = pd.NA
     assert upsert_df(conn, "t", df) == 1
@@ -122,24 +118,21 @@ def test_upsert_nullable_int64_with_na(conn):
 
 
 def test_upsert_nullable_int64_value(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b INTEGER)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b BIGINT)")
     df = pd.DataFrame({"a": ["A"], "b": pd.array([5], dtype="Int64")})
     assert upsert_df(conn, "t", df) == 1
     row = conn.execute("SELECT b, typeof(b) AS t FROM t").fetchone()
     assert row["b"] == 5
-    assert row["t"] == "integer"
+    assert row["t"] == "BIGINT"
 
 
 # ── upsert_df: 事务边界守护 ──
 
 def test_upsert_no_pk_table_delete_rolls_back_on_failure(conn):
-    class Unbindable:
-        pass
-
-    _table(conn, "CREATE TABLE t (a TEXT, b TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR CHECK (a <> 'bad'), b VARCHAR)")
     conn.execute("INSERT INTO t VALUES ('old', 'x')")
     conn.commit()
-    df = pd.DataFrame({"a": ["A"], "b": [Unbindable()]})
+    df = pd.DataFrame({"a": ["bad"], "b": ["y"]})
     with pytest.raises(Exception):
         upsert_df(conn, "t", df)
     n = conn.execute("SELECT count(*) FROM t").fetchone()[0]
@@ -148,7 +141,7 @@ def test_upsert_no_pk_table_delete_rolls_back_on_failure(conn):
 
 
 def test_upsert_column_order_mismatch(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b REAL, c TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b DOUBLE, c VARCHAR)")
     df = pd.DataFrame({"c": ["x"], "a": ["A"], "b": [1.5]})
     assert upsert_df(conn, "t", df) == 1
     row = dict(conn.execute("SELECT * FROM t").fetchone())
@@ -156,7 +149,7 @@ def test_upsert_column_order_mismatch(conn):
 
 
 def test_upsert_subset_columns_fill_null(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b REAL, c TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b DOUBLE, c VARCHAR)")
     df = pd.DataFrame({"a": ["A"], "b": [2.0]})
     assert upsert_df(conn, "t", df) == 1
     row = dict(conn.execute("SELECT * FROM t").fetchone())
@@ -164,7 +157,7 @@ def test_upsert_subset_columns_fill_null(conn):
 
 
 def test_upsert_nan_to_null(conn):
-    _table(conn, "CREATE TABLE t (a TEXT PRIMARY KEY, b REAL, c TEXT)")
+    _table(conn, "CREATE TABLE t (a VARCHAR PRIMARY KEY, b DOUBLE, c VARCHAR)")
     df = pd.DataFrame({"a": ["A"], "b": [float("nan")], "c": [float("nan")]})
     upsert_df(conn, "t", df)
     row = conn.execute("SELECT b IS NULL AS bnull, c IS NULL AS cnull FROM t").fetchone()
@@ -173,16 +166,16 @@ def test_upsert_nan_to_null(conn):
 
 
 def test_upsert_int_date_into_text_col(conn):
-    _table(conn, "CREATE TABLE t (trade_date TEXT PRIMARY KEY, val REAL)")
+    _table(conn, "CREATE TABLE t (trade_date VARCHAR PRIMARY KEY, val DOUBLE)")
     df = pd.DataFrame({"trade_date": [20200101], "val": [1.0]})
     upsert_df(conn, "t", df)
     row = conn.execute("SELECT trade_date, typeof(trade_date) AS t FROM t").fetchone()
     assert row["trade_date"] == "20200101"
-    assert row["t"] == "text"
+    assert row["t"] == "VARCHAR"
 
 
 def test_upsert_double_quote_column_name(conn):
-    _table(conn, 'CREATE TABLE t ("a""b" TEXT PRIMARY KEY, c TEXT)')
+    _table(conn, 'CREATE TABLE t ("a""b" VARCHAR PRIMARY KEY, c VARCHAR)')
     df = pd.DataFrame({"a\"b": ["x"], "c": ["y"]})
     assert upsert_df(conn, "t", df) == 1
     assert conn.execute('SELECT "a""b" FROM t').fetchone()[0] == "x"
@@ -352,14 +345,15 @@ def test_load_config_missing_message(tmp_path):
 
 # ── get_conn ──
 
-def test_get_conn_wal_busy_timeout_makedirs(tmp_path):
-    p = tmp_path / "sub" / "x.db"
+def test_get_conn_creates_file_and_schema(tmp_path):
+    p = tmp_path / "sub" / "x.duckdb"
     c = get_conn(str(p))
     try:
         assert os.path.exists(p)
-        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert c.execute("PRAGMA busy_timeout").fetchone()[0] == 10000
         assert c.execute("SELECT 1").fetchone()[0] == 1
+        assert c.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE table_name='pull_log'"
+        ).fetchone() is not None
     finally:
         c.close()
 
@@ -367,7 +361,7 @@ def test_get_conn_wal_busy_timeout_makedirs(tmp_path):
 def test_get_conn_memory_stays_memory():
     c = get_conn(":memory:")
     try:
-        assert c.execute("PRAGMA database_list").fetchall()[0][2] == ""
+        assert c.execute("SELECT current_database()").fetchone()[0] == "memory"
     finally:
         c.close()
 
@@ -382,15 +376,47 @@ def test_init_schema_idempotent(conn):
 
 
 def test_init_schema_migrates_legacy_pull_log():
-    c = sqlite3.connect(":memory:")
-    c.row_factory = sqlite3.Row
+    c = connect(":memory:")
     c.execute(
-        "CREATE TABLE pull_log (table_name TEXT NOT NULL, date_val TEXT NOT NULL, "
-        "ok INTEGER NOT NULL, PRIMARY KEY (table_name, date_val))"
+        "CREATE TABLE pull_log (table_name VARCHAR NOT NULL, date_val VARCHAR NOT NULL, "
+        "ok BIGINT NOT NULL, PRIMARY KEY (table_name, date_val))"
     )
     init_schema(c)
     cols = [r[1] for r in c.execute("PRAGMA table_info(pull_log)").fetchall()]
     assert cols == ["table_name", "date_val", "ok", "retry_count", "last_try"]
+
+
+def test_init_schema_adds_missing_generated_columns(monkeypatch):
+    c = connect(":memory:")
+    c.execute("CREATE TABLE custom_t (a BIGINT, PRIMARY KEY (a))")
+    c.execute("INSERT INTO custom_t VALUES (1)")
+    monkeypatch.setattr(utils, "load_schema_sql", lambda: (
+        'CREATE TABLE IF NOT EXISTS "custom_t" (\n'
+        '    a BIGINT,\n'
+        '    b VARCHAR,\n'
+        '    c BIGINT NOT NULL DEFAULT 7,\n'
+        '    PRIMARY KEY (a)\n);'))
+    init_schema(c)
+    cols = utils.engine.table_columns(c, "custom_t")
+    assert set(cols) == {"a", "b", "c"}
+    row = c.execute("SELECT a, b, c FROM custom_t").fetchone()
+    assert (row["a"], row["b"], row["c"]) == (1, None, 7)
+    c.execute("INSERT INTO custom_t (a) VALUES (2)")
+    assert c.execute("SELECT c FROM custom_t WHERE a=2").fetchone()[0] == 7
+
+
+def test_init_schema_legacy_pull_log_retry_count_default():
+    c = connect(":memory:")
+    c.execute(
+        "CREATE TABLE pull_log (table_name VARCHAR NOT NULL, date_val VARCHAR NOT NULL, "
+        "ok BIGINT NOT NULL, PRIMARY KEY (table_name, date_val))")
+    c.execute("INSERT INTO pull_log VALUES ('t', '20200101', 1)")
+    init_schema(c)
+    row = c.execute("SELECT retry_count, last_try FROM pull_log").fetchone()
+    assert row["retry_count"] == 0
+    c.execute("INSERT INTO pull_log (table_name, date_val, ok) VALUES ('t', '20200102', 1)")
+    assert c.execute(
+        "SELECT retry_count FROM pull_log WHERE date_val='20200102'").fetchone()[0] == 0
 
 
 def test_init_schema_empty_sql_raises(conn, monkeypatch):
@@ -401,20 +427,20 @@ def test_init_schema_empty_sql_raises(conn, monkeypatch):
 
 def test_init_schema_reads_fresh_from_disk(conn, monkeypatch, tmp_path):
     sql_file = tmp_path / "schema.sql"
-    sql_file.write_text("CREATE TABLE IF NOT EXISTS fresh_t (a TEXT);", encoding="utf-8")
+    sql_file.write_text("CREATE TABLE IF NOT EXISTS fresh_t (a VARCHAR);", encoding="utf-8")
     monkeypatch.setattr(utils, "load_schema_sql", lambda: sql_file.read_text(encoding="utf-8"))
     init_schema(conn)
     assert conn.execute(
-        "SELECT name FROM sqlite_master WHERE name='fresh_t'"
+        "SELECT 1 FROM duckdb_tables() WHERE table_name='fresh_t'"
     ).fetchone() is not None
     sql_file.write_text(
-        "CREATE TABLE IF NOT EXISTS fresh_t (a TEXT);\n"
-        "CREATE TABLE IF NOT EXISTS fresh_u (b TEXT);",
+        "CREATE TABLE IF NOT EXISTS fresh_t (a VARCHAR);\n"
+        "CREATE TABLE IF NOT EXISTS fresh_u (b VARCHAR);",
         encoding="utf-8",
     )
     init_schema(conn)
     assert conn.execute(
-        "SELECT name FROM sqlite_master WHERE name='fresh_u'"
+        "SELECT 1 FROM duckdb_tables() WHERE table_name='fresh_u'"
     ).fetchone() is not None
 
 
@@ -428,7 +454,7 @@ def test_schema_sql_pull_log_ddl_matches_contract():
     for field in ("table_name", "date_val", "ok", "retry_count", "last_try"):
         assert field in snippet
     assert "PRIMARY KEY (table_name, date_val)" in snippet
-    assert "retry_count INTEGER NOT NULL DEFAULT 0" in snippet
+    assert "retry_count BIGINT NOT NULL DEFAULT 0" in snippet
 
 
 # ── load_api_registry 缓存 ──
@@ -478,11 +504,11 @@ def test_beijing_today_is_date():
 def _init_pull_log(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pull_log (
-            table_name TEXT NOT NULL,
-            date_val   TEXT NOT NULL,
-            ok         INTEGER NOT NULL,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            last_try   TEXT DEFAULT NULL,
+            table_name VARCHAR NOT NULL,
+            date_val   VARCHAR NOT NULL,
+            ok         BIGINT NOT NULL,
+            retry_count BIGINT NOT NULL DEFAULT 0,
+            last_try   VARCHAR DEFAULT NULL,
             PRIMARY KEY (table_name, date_val)
         )
     """)
