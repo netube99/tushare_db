@@ -150,7 +150,7 @@ tushare_db/
 │   ├── binio.py                # bin 原子读写
 │   ├── features.py             # FeatureSync 全量转换
 │   └── incremental.py          # IncrementalSync + FieldRebuilder
-├── tests/                      # 308 tests, pytest
+├── tests/                      # 313 tests, pytest
 │   ├── test_pure.py            # 纯函数单测
 │   ├── test_state_machine.py   # 状态机单测
 │   ├── test_integration.py     # mock 集成测试
@@ -163,5 +163,5 @@ tushare_db/
 ## 测试
 
 ```bash
-pytest tests/ -v    # 308 tests，无需真实数据库
+pytest tests/ -v    # 313 tests，无需真实数据库
 ```
