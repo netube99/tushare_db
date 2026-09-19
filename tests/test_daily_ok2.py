@@ -81,7 +81,7 @@ def test_daily_revalidates_stale_ok2(scratch):
     assert last_dt >= now - timedelta(minutes=1)
     assert ("stk_factor_pro", {"trade_date": "20240101"}) in dc.calls
 
-    # 7 天内的 ok=2 不受影响（不删除、不重拉）
+    # 近期 ok=2 复验：无法重拉（日历无该日）时回填原记录，last_try 保持不变
     fresh_row = conn.execute(
         "SELECT last_try FROM pull_log WHERE table_name='stk_factor_pro' AND date_val='20240102'"
     ).fetchone()

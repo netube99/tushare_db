@@ -166,6 +166,90 @@ def test_daily_domain_once_bypasses_max_date_gate(daily_env, monkeypatch):
     assert pulled == ["000002.SZ"]
 
 
+# ── P1: 全新库空驱动表 → 按驱动表策略补拉窗口后继续 ──
+
+
+def test_domain_empty_driver_triggers_window_pull(monkeypatch):
+    """驱动表存在但为空时（全新库首轮，驱动表在 REGISTRY 中排后），
+    domain 策略不再静默跳过，而是按驱动表自身策略补拉 since~until 后继续."""
+    conn = make_conn()
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE t_dom (ts_code VARCHAR, ann_date VARCHAR)")
+    dom_entry = {"api": "stk_holdernumber", "table": "t_dom", "date_col": "ann_date",
+                 "driver": {"source_table": "stk_factor_pro",
+                            "source_column": "ts_code", "date_mode": "once"}}
+    drv_entry = {"api": "stk_factor_pro", "table": "stk_factor_pro",
+                 "date_col": "trade_date"}
+    monkeypatch.setattr(m, "REGISTRY", [dom_entry, drv_entry])
+    add_cal(conn, ["20240102", "20240103"])
+    dc = FakeDC(responses={
+        "stk_factor_pro": pd.DataFrame([
+            {"ts_code": "000001.SZ", "trade_date": "20240102"},
+            {"ts_code": "000002.SZ", "trade_date": "20240102"},
+        ]),
+    })
+
+    m._run_domain_strategy(conn, dc, dom_entry, "20240101", "20240110")
+
+    apis = [api for (api, _kw) in dc.calls]
+    assert "stk_factor_pro" in apis
+    assert max(i for i, a in enumerate(apis) if a == "stk_factor_pro") < \
+        min(i for i, a in enumerate(apis) if a == "stk_holdernumber")
+    codes = sorted(kw["ts_code"] for (api, kw) in dc.calls if api == "stk_holdernumber")
+    assert codes == ["000001.SZ", "000002.SZ"]
+    assert conn.execute("SELECT COUNT(*) FROM stk_factor_pro").fetchone()[0] > 0
+    assert conn.execute("SELECT ok FROM pull_log WHERE table_name='t_dom' "
+                        "AND date_val='000001.SZ__once__'").fetchone()[0] == 2
+
+
+def test_domain_empty_driver_still_empty_aborts(monkeypatch):
+    """驱动表补拉后仍无数据 → 记错误并返回，不进入逐域循环."""
+    conn = make_conn()
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("CREATE TABLE t_dom (ts_code VARCHAR, ann_date VARCHAR)")
+    dom_entry = {"api": "stk_holdernumber", "table": "t_dom", "date_col": "ann_date",
+                 "driver": {"source_table": "stk_factor_pro",
+                            "source_column": "ts_code", "date_mode": "once"}}
+    drv_entry = {"api": "stk_factor_pro", "table": "stk_factor_pro",
+                 "date_col": "trade_date"}
+    monkeypatch.setattr(m, "REGISTRY", [dom_entry, drv_entry])
+    add_cal(conn, ["20240102"])
+    dc = FakeDC()
+
+    m._run_domain_strategy(conn, dc, dom_entry, "20240101", "20240110")
+
+    assert [api for (api, _kw) in dc.calls] == ["stk_factor_pro"]
+    assert conn.execute("SELECT COUNT(*) FROM pull_log WHERE table_name='t_dom'"
+                        ).fetchone()[0] == 0
+
+
+# ── P2: daily 的 domain 周期以 backfill_since 为起点 ──
+
+
+def test_daily_domain_monthly_bounded_by_backfill_since(daily_env, monkeypatch):
+    """daily 对 domain-monthly 传配置 backfill_since，而非 None 全历史扫描."""
+    conn = daily_env
+    conn.execute("CREATE TABLE index_weight (index_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("INSERT INTO index_weight VALUES ('000300.SH', '20250102')")
+    conn.commit()
+    monkeypatch.setattr(m, "REGISTRY",
+                        [next(e for e in REGISTRY if e["table"] == "index_weight")])
+
+    seen = {}
+
+    def fake_dispatch(conn, dc, entry, strategy=None, since=None, until=None, **kw):
+        seen["strategy"] = strategy or m._get_date_params(entry)
+        seen["since"] = since
+
+    monkeypatch.setattr(m, "_dispatch_strategy", fake_dispatch)
+
+    m._cmd_daily(conn, FakeDC(), _Args(until="20250210"),
+                 {"backfill_since": "20240101"}, "run", 0.0)
+
+    assert seen["strategy"]["date_mode"] == "monthly"
+    assert seen["since"] == "20240101"
+
+
 # ── D5: ok=2 复验窗口 last_try 格式不一致 ──
 
 
@@ -190,6 +274,62 @@ def test_daily_ok2_window_respects_seven_days(daily_env, monkeypatch):
         "AND date_val='20240101'").fetchone()
     assert row is not None and row[0] == last_try
     assert ("stk_factor_pro", {"trade_date": "20240101"}) not in dc.calls
+
+
+# ── P3: 近期 ok=2 每日复验（隔日发布接口）──
+
+
+def test_daily_recent_ok2_rechecked_and_filled(daily_env, monkeypatch):
+    """昨日首拉为空(ok=2)的空日，次日 daily 应自动复验并补齐（margin 场景）."""
+    conn = daily_env
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("INSERT INTO stk_factor_pro VALUES ('600000.SH', '20260917')")
+    conn.commit()
+    monkeypatch.setattr(m, "REGISTRY",
+                        [next(e for e in REGISTRY if e["table"] == "stk_factor_pro")])
+    fixed = datetime(2026, 9, 19, 20, 30, 0, tzinfo=CST)
+    monkeypatch.setattr(m, "beijing_now", lambda: fixed)
+    add_cal(conn, ["20260917", "20260918"])
+    pl(conn, "stk_factor_pro", "20260918", 2, last_try="2026-09-19 07:45:00")
+    conn.commit()
+    dc = FakeDC(responses={"stk_factor_pro": pd.DataFrame([
+        {"ts_code": "600000.SH", "trade_date": "20260918"}])})
+
+    m._cmd_daily(conn, dc, _Args(until="20260918"),
+                 {"backfill_since": "20260901"}, "run", 0.0)
+
+    assert ("stk_factor_pro", {"trade_date": "20260918"}) in dc.calls
+    ok = conn.execute(
+        "SELECT ok FROM pull_log WHERE table_name='stk_factor_pro' "
+        "AND date_val='20260918'").fetchone()[0]
+    assert ok == 1
+
+
+def test_daily_recent_ok2_still_empty_refreshes_last_try(daily_env, monkeypatch):
+    """复验仍为空 → 保持 ok=2 并刷新 last_try，次日继续复验，不会误判为 ok=1."""
+    conn = daily_env
+    conn.execute("CREATE TABLE stk_factor_pro (ts_code VARCHAR, trade_date VARCHAR)")
+    conn.execute("INSERT INTO stk_factor_pro VALUES ('600000.SH', '20260917')")
+    conn.commit()
+    monkeypatch.setattr(m, "REGISTRY",
+                        [next(e for e in REGISTRY if e["table"] == "stk_factor_pro")])
+    fixed = datetime(2026, 9, 20, 20, 30, 0, tzinfo=CST)
+    monkeypatch.setattr(m, "beijing_now", lambda: fixed)
+    monkeypatch.setattr(database.etl, "beijing_now", lambda: fixed)
+    add_cal(conn, ["20260917", "20260918"])
+    pl(conn, "stk_factor_pro", "20260918", 2, last_try="2026-09-19 07:45:00")
+    conn.commit()
+    dc = FakeDC()
+
+    m._cmd_daily(conn, dc, _Args(until="20260918"),
+                 {"backfill_since": "20260901"}, "run", 0.0)
+
+    assert ("stk_factor_pro", {"trade_date": "20260918"}) in dc.calls
+    row = conn.execute(
+        "SELECT ok, last_try FROM pull_log WHERE table_name='stk_factor_pro' "
+        "AND date_val='20260918'").fetchone()
+    assert row[0] == 2
+    assert row[1] == "2026-09-20 20:30:00"
 
 
 # ── D3: infra 日历落后于当前日期时应补缺口 ──

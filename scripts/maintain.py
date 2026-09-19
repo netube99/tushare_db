@@ -82,6 +82,14 @@ def _resolve_until() -> str:
     return until_date.strftime("%Y%m%d")
 
 
+def _default_backfill_since() -> str:
+    """配置中的建库起始日；配置不可用时退回常量."""
+    try:
+        return load_config().get("backfill_since", DEFAULT_BACKFILL_SINCE)
+    except Exception:
+        return DEFAULT_BACKFILL_SINCE
+
+
 def _api_spec(entry: dict) -> dict | None:
     """api_index.json 中该 entry 的原始接口定义."""
     from database.utils import load_api_registry
@@ -456,7 +464,8 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
     """domain 策略：逐域值 × 逐日期周期拉取.
 
     Args:
-        since: 起始边界，None 则不限（daily 利用 pull_log 实现增量）
+        since: 起始周期边界；None 不设限（once 模式/点修复用，driver 空表兜底时
+               退回配置 backfill_since），daily 传配置 backfill_since
         until: 结束边界，None 则由 _resolve_until 自动判定
         filter_date_val: 非 None 时仅处理匹配的单个 date_val（点修复）
     """
@@ -465,6 +474,9 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
     table = entry["table"]
     date_mode = driver["date_mode"]
     _pfx = _make_pfx(progress)
+
+    if until is None:
+        until = _resolve_until()
 
     # 1. 获取域列表（优先静态 values，否则从驱动表查询）
     if "values" in driver:
@@ -486,21 +498,26 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
         try:
             domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
         except Exception:
-            logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不可用，尝试拉取")
+            logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不可用")
+            domain_vals = []
+
+        # 空驱动表（全新库首轮常见：驱动表在 REGISTRY 中排在本表之后）：
+        # 按驱动表自身策略补拉 since~until 窗口，再重取域列表，避免静默跳过整表
+        if not domain_vals:
+            logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 无数据，尝试拉取")
             drv_entry = _find_entry(table=source_table)
             if drv_entry:
-                _run_once_strategy(conn, dc, drv_entry)
+                drv_since = since or _default_backfill_since()
+                _dispatch_strategy(conn, dc, drv_entry, None, drv_since, until,
+                                   progress=progress)
                 domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
             else:
-                domain_vals = []
                 logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不在 REGISTRY，无法拉取")
             if not domain_vals:
-                logger.error(f"{_pfx}{api_name}: 驱动表 {source_table} 无数据，跳过")
+                logger.error(f"{_pfx}{api_name}: 驱动表 {source_table} 仍无数据，跳过")
                 return
 
     # 2. 获取日期周期
-    if until is None:
-        until = _resolve_until()
     periods = _get_date_periods(conn, date_mode, since, until)
     if not periods:
         logger.warning(f"{_pfx}{api_name}: 无可用周期，跳过")
@@ -945,6 +962,51 @@ def _cmd_cleanup(conn, dc, args, run_id, t_start):
     _write_run_end(conn, run_id, t_start)
 
 
+def _recheck_ok2_empty(conn, dc, where_sql: str, params: tuple, label: str) -> None:
+    """删除并复验命中条件的 ok=2 空日（仅 trade_date 策略批量重拉）.
+
+    近期空日每日复验用于隔日发布接口（如 margin 次日早晨才发布）；
+    超期空日复验用于长尾兜底。非日频策略交由全量回补复检。
+    未被重拉的记录（日历缺该日/限流中断等）回填原状态，避免 pull_log 状态丢失。
+    """
+    rows = conn.execute(
+        f"SELECT table_name, date_val, last_try, retry_count FROM pull_log "
+        f"WHERE ok=2 AND {where_sql}",
+        params,
+    ).fetchall()
+    if not rows:
+        return
+    logger.info(f"[daily] 发现 {len(rows)} 条{label} ok=2 记录，删除并复验…")
+    by_table: dict[str, list[str]] = {}
+    backups: list[tuple] = []
+    for (table, date_val, last_try, retry_count) in rows:
+        by_table.setdefault(table, []).append(date_val)
+        backups.append((table, date_val, last_try, retry_count))
+    conn.execute(f"DELETE FROM pull_log WHERE ok=2 AND {where_sql}", params)
+    conn.commit()
+    try:
+        for table, dates in by_table.items():
+            entry = _find_entry(table=table)
+            if not entry:
+                logger.warning(f"[daily] {table} 不在 REGISTRY，跳过复验")
+                continue
+            strategy = _get_date_params(entry)
+            if strategy["strategy"] != "trade_date":
+                logger.info(
+                    f"[daily] {table}: {len(dates)} 条空日非日频策略，交由全量回补复检")
+                continue
+            s, u = min(dates), max(dates)
+            logger.info(f"[daily] {table}: 复验 {len(dates)} 个{label}空日 [{s}..{u}]")
+            _dispatch_strategy(conn, dc, entry, strategy, s, u)
+    finally:
+        conn.executemany(
+            "INSERT OR IGNORE INTO pull_log "
+            "(table_name, date_val, ok, retry_count, last_try) VALUES (?, ?, 2, ?, ?)",
+            [(t, d, rc, lt) for (t, d, lt, rc) in backups],
+        )
+        conn.commit()
+
+
 def _cmd_daily(conn, dc, args, config, run_id, t_start):
     """--daily: 逐表补缺口 + ok=2 超期重试 + ok=0 自动修复 + 质检."""
     target_str = args.until or _resolve_until()
@@ -965,9 +1027,12 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
 
         if entry.get("driver") and strategy.get("date_mode") == "once":
             # once 域表（如 dividend 逐股全量）：MAX(date_col) 无法反映新域值，
-            # 直接全量 dispatch，未拉过的域值由 pull_log done 检查自动补齐
+            # 直接全量 dispatch，未拉过的域值由 pull_log done 检查自动补齐；
+            # since 仅供驱动表为空时兜底补拉使用（once 周期本身与 since 无关）
             logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 逐域刷新")
-            _dispatch_strategy(conn, dc, entry, strategy, None, target_str, progress=p)
+            _dispatch_strategy(conn, dc, entry, strategy,
+                               config.get("backfill_since", DEFAULT_BACKFILL_SINCE),
+                               target_str, progress=p)
             logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
             continue
 
@@ -980,7 +1045,12 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
         else:
             since = last
 
-        logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: {since} → {target_str}")
+        if strategy["strategy"] == "domain":
+            # domain 按配置建库边界补缺口；传 None 会从日历最早日全历史扫描
+            ds = config.get("backfill_since", DEFAULT_BACKFILL_SINCE)
+        else:
+            ds = since
+        logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: {ds} → {target_str}")
         if strategy["strategy"] == "date_range":
             current_year = target_str[:4]
             conn.execute(
@@ -988,7 +1058,6 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
                 (table, current_year),
             )
             conn.commit()
-        ds = None if strategy["strategy"] == "domain" else since
         _dispatch_strategy(conn, dc, entry, strategy, ds, target_str, progress=p)
         logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
 
@@ -1006,35 +1075,17 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
 
     _verify(conn)
 
-    # ok=2 超期重试
+    # ok=2 复验：近期（默认 3 天）每日重验，覆盖隔日发布接口（如 margin）首拉为空；
+    # 超期（>7 天）批量重拉兜底，两者窗口之间留待下一轮扫描
+    OK2_RECHECK_DAYS = 3
     OK2_RETRY_DAYS = 7
-    ok2_cutoff = (beijing_now() - timedelta(days=OK2_RETRY_DAYS)).strftime(
+    now = beijing_now()
+    recent_cutoff = (now - timedelta(days=OK2_RECHECK_DAYS)).strftime(
         "%Y-%m-%d %H:%M:%S")
-    ok2_retry = conn.execute(
-        "SELECT table_name, date_val FROM pull_log WHERE ok=2 AND last_try < ?",
-        (ok2_cutoff,)
-    ).fetchall()
-    if ok2_retry:
-        logger.info(f"[daily] 发现 {len(ok2_retry)} 条超期 ok=2 记录，删除并复验…")
-        by_table: dict[str, list[str]] = {}
-        for (table, date_val) in ok2_retry:
-            by_table.setdefault(table, []).append(date_val)
-        conn.execute(
-            "DELETE FROM pull_log WHERE ok=2 AND last_try < ?", (ok2_cutoff,))
-        conn.commit()
-        for table, dates in by_table.items():
-            entry = _find_entry(table=table)
-            if not entry:
-                logger.warning(f"[daily] {table} 不在 REGISTRY，跳过复验")
-                continue
-            strategy = _get_date_params(entry)
-            if strategy["strategy"] != "trade_date":
-                logger.info(
-                    f"[daily] {table}: {len(dates)} 条空日非日频策略，交由全量回补复检")
-                continue
-            s, u = min(dates), max(dates)
-            logger.info(f"[daily] {table}: 复验 {len(dates)} 个超期空日 [{s}..{u}]")
-            _dispatch_strategy(conn, dc, entry, strategy, s, u)
+    overdue_cutoff = (now - timedelta(days=OK2_RETRY_DAYS)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    _recheck_ok2_empty(conn, dc, "last_try >= ?", (recent_cutoff,), "近期")
+    _recheck_ok2_empty(conn, dc, "last_try < ?", (overdue_cutoff,), "超期")
 
     # 自动修复 ok=0 记录
     MAX_RETRY_ATTEMPTS = 5

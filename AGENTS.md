@@ -229,7 +229,7 @@ main()
        ├─ 3. trade_cal 补拉
        └─ 4. stock_basic / index_basic 刷新
   │
-  ├─ --daily    → 逐表补缺口 → 刷新 once-only 表 → 质检 → ok=2 超期复验（删除后按表重拉）→ 自动修复 ok=0
+  ├─ --daily    → 逐表补缺口 → 刷新 once-only 表 → 质检 → ok=2 复验（3 天内每日重验，超期删除后按表重拉）→ 自动修复 ok=0
   ├─ --refresh  → 单表单日修复
   ├─ --dry-run  → 打印策略矩阵（无副作用）
   │
@@ -254,6 +254,10 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 才能拿到按 ann_date 逐日拉取永远丢失的多阶段行与 `ann_date=NULL` 行。
 `stk_holdernumber`/`stk_holdertrade`/`pledge_detail` 同款：无主键（`_project.no_pk`）+
 `partition_key=ts_code` 分区替换（DELETE 本域旧行再插入），上游同日多公告/无唯一列时零丢失。
+
+domain 周期边界：backfill 用 `--since`，daily 传配置 `backfill_since`（不再传 `None` 全历史扫描）。
+驱动表为空时（全新库首轮，驱动表在 REGISTRY 中可能排在本表之后）按驱动表自身策略补拉
+`since~until` 后重取域列表，仍为空才跳过并记 error，不再静默结束。
 
 ### pull_after 时间门禁
 
@@ -379,10 +383,10 @@ tests/test_pure.py            — 纯函数单测（infer_pk, _quote_name, date_
 tests/test_state_machine.py   — 状态机单测（upsert_df, log_pull ok 流转）
 tests/test_integration.py     — mock 集成测试（_fetch_with_retry 各分支）
 tests/test_regression.py      — 回归护栏（TABLE_SPECS 键名一致性）
-tests/test_daily_ok2.py       — _cmd_daily ok=2 超期复验 + domain-once 逐域补齐回归
+tests/test_daily_ok2.py       — _cmd_daily ok=2 近期/超期复验 + domain-once 逐域补齐回归
 tests/test_client_review.py   — DataClient 审查回归（翻页错误传播、冷却、缓存、节流、守护）
 tests/test_db_review.py       — 存储层审查回归（upsert_df 边界、schema 加载、原子写、日志器）
-tests/test_maintain_review.py — maintain 审查回归（策略矩阵、分区替换原子性、refresh/infra 边界）
+tests/test_maintain_review.py — maintain 审查回归（策略矩阵、分区替换原子性、refresh/infra 边界、空驱动表补拉、daily domain 周期边界）
 tests/test_qlib_review.py     — qlib_export 审查回归（bin 格式、增量检测、中断续转、字段重建）
 tests/test_schema_gen_review.py — schema 生成链审查回归（分级、主键推断、保留字、REGISTRY 注入）
 tests/test_config_review.py   — 配置与辅助脚本审查回归（模板键一致性、派生表原子替换）
@@ -390,7 +394,7 @@ tests/test_duckdb_review.py   — DuckDB 引擎回归（Row/Result/锁/事务/�
 tests/test_migrate_review.py  — 迁移脚本回归（进度隔离、完成判定、原子写）
 ```
 
-308 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
+313 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
 
 ---
 
