@@ -7,14 +7,16 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from database.utils import beijing_now
+from database.utils import PROJECT_ROOT, beijing_now
 
 
 class JsonLogger:
     """线程安全的 JSON Lines 日志写入器，按日切换文件."""
 
-    def __init__(self, log_dir: str = "logs"):
-        self._log_dir = Path(log_dir)
+    def __init__(self, log_dir: str | None = None):
+        # 缺省锚定项目根：此前相对 cwd，maintain.py 支持任意 cwd 运行后
+        # 日志会散落到调用方目录
+        self._log_dir = Path(log_dir) if log_dir else Path(PROJECT_ROOT) / "logs"
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._current_date: str = ""

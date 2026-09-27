@@ -15,13 +15,16 @@ import os
 import sys
 import time
 
-sys.path.insert(0, '.')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timedelta
 from database import get_conn, load_config, DataClient
 from database.etl import REGISTRY, log_pull
 import database.etl as _etl_module
-from database.utils import init_schema, upsert_df, beijing_now, beijing_today
+from database.utils import (init_schema, upsert_df, beijing_now, beijing_today,
+                            setup_console_utf8)
 from database.client import TushareError, DailyLimitError
+
+setup_console_utf8()
 
 logger = logging.getLogger("maintain")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")

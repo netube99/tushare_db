@@ -21,7 +21,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import engine
-from database.utils import get_conn, beijing_now
+from database.utils import get_conn, beijing_now, setup_console_utf8
 from qlib_export import (
     build_field_map,
     init_sync_log, is_synced, clear_all_sync_log,
@@ -29,6 +29,8 @@ from qlib_export import (
     InstrumentSync, IndexConstituentSync, get_instruments_for_table,
     FeatureSync, IncrementalSync, FieldRebuilder,
 )
+
+setup_console_utf8()
 
 # ---------------------------------------------------------------------------
 # 路径常量

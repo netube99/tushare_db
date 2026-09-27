@@ -41,13 +41,17 @@ class DataClient:
     def __init__(
         self,
         token: str,
-        cache_path: str = "cache/tushare",
+        cache_path: str | None = None,
         url: str = "https://api.tushare.pro",
         timeout: int = 30,
     ):
         self._token = token
         self._url = url
         self._timeout = timeout
+        if cache_path is None:
+            # 缺省锚定项目根：此前相对 cwd，从任意目录运行会把缓存散落到调用方目录
+            from database.utils import PROJECT_ROOT
+            cache_path = str(Path(PROJECT_ROOT) / "cache" / "tushare")
         self.cache_path = Path(cache_path)
         self.cache_path.mkdir(parents=True, exist_ok=True)
         self._cache_lock = threading.Lock()
@@ -81,7 +85,7 @@ class DataClient:
     def _load_cooldown(self) -> None:
         """从磁盘加载天级限流冷却状态（跨进程持久化）."""
         try:
-            with open(self._cooldown_file) as f:
+            with open(self._cooldown_file, encoding="utf-8") as f:
                 data = json.load(f)
             now = time.time()
             self._daily_cooldown_until = {

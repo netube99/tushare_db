@@ -9,7 +9,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from database.utils import atomic_write_text, load_api_registry
+from database.utils import atomic_write_text, load_api_registry, setup_console_utf8
+
+setup_console_utf8()
 
 
 # ── 纯函数 ──
@@ -290,7 +292,7 @@ def generate_registry(api_list: list[dict]) -> str:
 
 def inject_registry(etl_path: str, registry_code: str) -> None:
     """将 REGISTRY 代码注入 etl.py，替换 REGISTRY = [...] 段（原子写）."""
-    with open(etl_path) as f:
+    with open(etl_path, encoding="utf-8") as f:
         content = f.read()
 
     try:
@@ -323,7 +325,7 @@ def inject_registry(etl_path: str, registry_code: str) -> None:
     except SyntaxError as e:
         raise ValueError(f"注入后 etl.py 语法非法: {e}")
     tmp_path = etl_path + ".tmp"
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(new_content)
     os.replace(tmp_path, etl_path)
 

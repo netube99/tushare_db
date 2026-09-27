@@ -1,7 +1,6 @@
 """DuckDB 引擎层 — 连接封装、行访问、schema 元数据、跨进程锁."""
 from __future__ import annotations
 
-import fcntl
 import os
 import time
 from contextlib import contextmanager
@@ -9,6 +8,13 @@ from typing import Any, Iterator, Sequence
 
 import duckdb
 import pandas as pd
+
+try:
+    import fcntl  # POSIX 文件锁
+    _HAS_FCNTL = True
+except ImportError:  # Windows 无 fcntl，退回 LockFileEx（语义对齐 flock）
+    fcntl = None
+    _HAS_FCNTL = False
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_NAME = "market.duckdb"
@@ -308,6 +314,7 @@ def db_lock(db_path: str | None = None, exclusive: bool = True,
 
     timeout=None 无限等待；timeout=0 立即返回 False；timeout>0 轮询到超时。
     不可重入：同进程对同一路径嵌套获取（即使 timeout=0）会失败，禁止嵌套调用。
+    POSIX 走 fcntl.flock；Windows 走 LockFileEx 字节范围锁（共享/排他语义一致）。
     """
     path = _lock_path(db_path)
     if path is None:
@@ -315,29 +322,96 @@ def db_lock(db_path: str | None = None, exclusive: bool = True,
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
-    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     acquired = False
     try:
-        if timeout is None:
-            fcntl.flock(fd, flags)
-            acquired = True
-        else:
-            deadline = time.monotonic() + timeout
-            acquired = False
-            while True:
-                try:
-                    fcntl.flock(fd, flags | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
+        if _HAS_FCNTL:
+            flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if timeout is None:
+                fcntl.flock(fd, flags)
+                acquired = True
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(fd, flags | fcntl.LOCK_NB)
+                        acquired = True
                         break
-                    time.sleep(0.2)
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.2)
+        else:
+            acquired = _win_lock(fd, exclusive, timeout)
         yield acquired
     finally:
         if acquired:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if _HAS_FCNTL:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            else:
+                _win_unlock(fd)
         os.close(fd)
+
+
+if not _HAS_FCNTL:
+    import ctypes
+    import msvcrt
+
+    _LOCKFILE_EXCLUSIVE_LOCK = 0x2
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x1
+
+    class _OVERLAPPED(ctypes.Structure):
+        # 省略官方结构中 Offset/OffsetHigh 与 PVOID Pointer 的联合体：两者同为
+        # 8 字节且只用零值，内存布局等价（x64 实测 sizeof=32、偏移一致）
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", ctypes.c_uint32),
+            ("OffsetHigh", ctypes.c_uint32),
+            ("hEvent", ctypes.c_void_p),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.LockFileEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(_OVERLAPPED)]
+    _kernel32.LockFileEx.restype = ctypes.c_int
+    _kernel32.UnlockFileEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.POINTER(_OVERLAPPED)]
+    _kernel32.UnlockFileEx.restype = ctypes.c_int
+
+    _ERROR_LOCK_VIOLATION = 33
+
+    def _win_lock(fd: int, exclusive: bool, timeout: float | None) -> bool:
+        """LockFileEx 锁 1 字节：共享读/排他写；统一 FAIL_IMMEDIATELY + 轮询.
+
+        LockFileEx 是 Windows 唯一支持共享锁的文件锁原语（msvcrt.locking 仅排他）。
+        timeout=None 也走轮询而非阻塞调用：阻塞版在 kernel32 内部不响应
+        Ctrl+C，且会把任何失败静默当作锁冲突无限等待；轮询版可中断，且仅
+        ERROR_LOCK_VIOLATION 视为锁冲突，其余错误立即抛出（与 flock 语义对齐）。
+        """
+        handle = msvcrt.get_osfhandle(fd)
+        overlapped = _OVERLAPPED()
+        flags = _LOCKFILE_FAIL_IMMEDIATELY | (
+            _LOCKFILE_EXCLUSIVE_LOCK if exclusive else 0)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if _kernel32.LockFileEx(
+                    ctypes.c_void_p(handle), flags, 0, 1, 0,
+                    ctypes.byref(overlapped)):
+                return True
+            err = ctypes.get_last_error()
+            if err != _ERROR_LOCK_VIOLATION:
+                raise ctypes.WinError(err)
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _win_unlock(fd: int) -> None:
+        handle = msvcrt.get_osfhandle(fd)
+        overlapped = _OVERLAPPED()
+        _kernel32.UnlockFileEx(
+            ctypes.c_void_p(handle), 0, 1, 0, ctypes.byref(overlapped))
 
 
 def _quote_ident(name: str) -> str:

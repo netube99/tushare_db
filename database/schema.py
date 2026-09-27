@@ -7,7 +7,7 @@ _SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
 def load_schema_sql() -> str:
     """每次调用时读取磁盘上的 schema.sql，保证子进程重生成后能读到新 DDL."""
     try:
-        with open(_SCHEMA_PATH) as f:
+        with open(_SCHEMA_PATH, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return ""

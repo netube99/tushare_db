@@ -35,6 +35,18 @@ def beijing_now() -> datetime:
     return datetime.now(_CST)
 
 
+def setup_console_utf8() -> None:
+    """Windows 下管道/重定向输出默认 GBK，✓⚠┌ 等字符会 UnicodeEncodeError；
+    重配置为 UTF-8 输出（POSIX 上幂等无害）。"""
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def atomic_write_text(path, text: str) -> None:
     """原子写文本文件：tmp 文件 + os.replace，防 SIGKILL 截断；失败时清理 tmp."""
     path = str(path)
@@ -234,7 +246,7 @@ def load_api_registry() -> list[dict]:
     if _registry_cache is not None:
         return _registry_cache
     path = os.path.join(PROJECT_ROOT, "api_index.json")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         _registry_cache = json.load(f)
     return _registry_cache
 
@@ -254,7 +266,7 @@ def load_config(config_path: str | None = None) -> dict:
     if config_path is None:
         config_path = os.path.join(PROJECT_ROOT, "user_config.yaml")
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
         raise FileNotFoundError(

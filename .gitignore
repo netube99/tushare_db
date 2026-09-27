@@ -17,3 +17,6 @@ __pycache__/
 # IDE / AI 工具
 .claude/
 .aider.tags.cache.v4/
+
+# 会话产生的临时运行日志
+logs_*.log

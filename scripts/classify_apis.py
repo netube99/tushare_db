@@ -18,7 +18,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from database.utils import atomic_write_text, load_config
+from database.utils import atomic_write_text, load_config, setup_console_utf8
+
+setup_console_utf8()
 
 INDEX_FILE = PROJECT_ROOT / "api_index.json"
 
