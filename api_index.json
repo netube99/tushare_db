@@ -407,6 +407,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -2653,13 +2660,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -7599,6 +7599,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -7959,6 +7966,13 @@
           "399673.SZ"
         ],
         "date_mode": "daily"
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -17657,6 +17671,14 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 2,
+        "rule_label": "100/min",
+        "usable": true,
+        "effective_rate": 100,
+        "recommended_interval_ms": 750,
+        "note": "频率限制100/min（低于标准500）"
       }
     }
   },
@@ -17761,6 +17783,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -18837,6 +18866,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -18901,6 +18937,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
