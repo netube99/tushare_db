@@ -266,6 +266,9 @@ def generate_registry(api_list: list[dict]) -> str:
 
         upsert = proj.get("upsert", {})
         frags = [f'    {{"api": "{table}", "table": "{table}"']
+        if proj.get("no_pk") or proj.get("pk_override"):
+            primary_key = [c.strip().strip('"') for c in pk.strip("()").split(",")] if pk else []
+            frags.append(f', "primary_key": {_json.dumps(primary_key)}')
         if date_col:
             frags.append(f', "date_col": "{date_col}"')
         if proj.get("driver"):

@@ -44,22 +44,6 @@ CREATE TABLE IF NOT EXISTS "fund_adj" (
     PRIMARY KEY (ts_code, trade_date)
 );
 
--- ETF日线行情
-CREATE TABLE IF NOT EXISTS "fund_daily" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    open DOUBLE,
-    high DOUBLE,
-    low DOUBLE,
-    close DOUBLE,
-    pre_close DOUBLE,
-    change DOUBLE,
-    pct_chg DOUBLE,
-    vol DOUBLE,
-    amount DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
 -- 可转债技术面因子(专业版)
 CREATE TABLE IF NOT EXISTS "cb_factor_pro" (
     ts_code VARCHAR,
@@ -195,6 +179,14 @@ CREATE TABLE IF NOT EXISTS "cb_basic" (
     newest_rating VARCHAR,
     rating_comp VARCHAR,
     PRIMARY KEY (ts_code)
+);
+
+-- 基金规模
+CREATE TABLE IF NOT EXISTS "fund_share" (
+    ts_code VARCHAR,
+    trade_date VARCHAR,
+    fd_share DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
 );
 
 -- 基金技术面因子(专业版)
@@ -501,22 +493,6 @@ CREATE TABLE IF NOT EXISTS "index_member_all" (
     PRIMARY KEY (ts_code)
 );
 
--- 中信行业指数日行情
-CREATE TABLE IF NOT EXISTS "ci_daily" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    open DOUBLE,
-    low DOUBLE,
-    high DOUBLE,
-    close DOUBLE,
-    pre_close DOUBLE,
-    change DOUBLE,
-    pct_change DOUBLE,
-    vol DOUBLE,
-    amount DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
 -- 申万行业指数日行情
 CREATE TABLE IF NOT EXISTS "sw_daily" (
     ts_code VARCHAR,
@@ -534,22 +510,6 @@ CREATE TABLE IF NOT EXISTS "sw_daily" (
     pb DOUBLE,
     float_mv DOUBLE,
     total_mv DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
--- 指数日线行情
-CREATE TABLE IF NOT EXISTS "index_daily" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    close DOUBLE,
-    open DOUBLE,
-    high DOUBLE,
-    low DOUBLE,
-    pre_close DOUBLE,
-    change DOUBLE,
-    pct_chg DOUBLE,
-    vol DOUBLE,
-    amount DOUBLE,
     PRIMARY KEY (ts_code, trade_date)
 );
 
@@ -623,8 +583,7 @@ CREATE TABLE IF NOT EXISTS "block_trade" (
     vol DOUBLE,
     amount DOUBLE,
     buyer VARCHAR,
-    seller VARCHAR,
-    PRIMARY KEY (ts_code, trade_date)
+    seller VARCHAR
 );
 
 -- 股东人数
@@ -844,7 +803,7 @@ CREATE TABLE IF NOT EXISTS "kpl_concept_cons" (
     trade_date VARCHAR,
     "desc" VARCHAR,
     hot_num BIGINT,
-    PRIMARY KEY (ts_code, trade_date)
+    PRIMARY KEY (ts_code, con_code, trade_date)
 );
 
 -- 龙虎榜每日统计单
@@ -863,8 +822,7 @@ CREATE TABLE IF NOT EXISTS "top_list" (
     net_rate DOUBLE,
     amount_rate DOUBLE,
     float_values DOUBLE,
-    reason VARCHAR,
-    PRIMARY KEY (ts_code, trade_date)
+    reason VARCHAR
 );
 
 -- 每日筹码及胜率
@@ -1157,62 +1115,6 @@ CREATE TABLE IF NOT EXISTS "stk_factor_pro" (
     PRIMARY KEY (ts_code, trade_date)
 );
 
--- 股票技术因子（量化因子）
-CREATE TABLE IF NOT EXISTS "stk_factor" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    close DOUBLE,
-    open DOUBLE,
-    high DOUBLE,
-    low DOUBLE,
-    pre_close DOUBLE,
-    change DOUBLE,
-    pct_change DOUBLE,
-    vol DOUBLE,
-    amount DOUBLE,
-    adj_factor DOUBLE,
-    open_hfq DOUBLE,
-    open_qfq DOUBLE,
-    close_hfq DOUBLE,
-    close_qfq DOUBLE,
-    high_hfq DOUBLE,
-    high_qfq DOUBLE,
-    low_hfq DOUBLE,
-    low_qfq DOUBLE,
-    pre_close_hfq DOUBLE,
-    pre_close_qfq DOUBLE,
-    macd_dif DOUBLE,
-    macd_dea DOUBLE,
-    macd DOUBLE,
-    kdj_k DOUBLE,
-    kdj_d DOUBLE,
-    kdj_j DOUBLE,
-    rsi_6 DOUBLE,
-    rsi_12 DOUBLE,
-    rsi_24 DOUBLE,
-    boll_upper DOUBLE,
-    boll_mid DOUBLE,
-    boll_lower DOUBLE,
-    cci DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
--- 历史日线
-CREATE TABLE IF NOT EXISTS "daily" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    open DOUBLE,
-    high DOUBLE,
-    low DOUBLE,
-    close DOUBLE,
-    pre_close DOUBLE,
-    change DOUBLE,
-    pct_chg DOUBLE,
-    vol DOUBLE,
-    amount DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
 -- 备用行情
 CREATE TABLE IF NOT EXISTS "bak_daily" (
     ts_code VARCHAR,
@@ -1256,37 +1158,6 @@ CREATE TABLE IF NOT EXISTS "stk_limit" (
     pre_close DOUBLE,
     up_limit DOUBLE,
     down_limit DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
--- 每日指标
-CREATE TABLE IF NOT EXISTS "daily_basic" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    close DOUBLE,
-    turnover_rate DOUBLE,
-    turnover_rate_f DOUBLE,
-    volume_ratio DOUBLE,
-    pe DOUBLE,
-    pe_ttm DOUBLE,
-    pb DOUBLE,
-    ps DOUBLE,
-    ps_ttm DOUBLE,
-    dv_ratio DOUBLE,
-    dv_ttm DOUBLE,
-    total_share DOUBLE,
-    float_share DOUBLE,
-    free_share DOUBLE,
-    total_mv DOUBLE,
-    circ_mv DOUBLE,
-    PRIMARY KEY (ts_code, trade_date)
-);
-
--- 复权因子
-CREATE TABLE IF NOT EXISTS "adj_factor" (
-    ts_code VARCHAR,
-    trade_date VARCHAR,
-    adj_factor DOUBLE,
     PRIMARY KEY (ts_code, trade_date)
 );
 

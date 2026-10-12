@@ -234,7 +234,7 @@ def test_connect_file_and_read_only(tmp_path):
 def test_connect_rejects_legacy_sqlite_file(tmp_path):
     p = tmp_path / "legacy.db"
     p.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
-    with pytest.raises(RuntimeError, match="SQLite"):
+    with pytest.raises(RuntimeError, match="SQLite.*请选择 DuckDB 数据库文件"):
         connect(str(p))
 
 

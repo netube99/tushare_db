@@ -407,13 +407,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -2660,6 +2653,13 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
+      },
+      "classification": {
+        "rule": 1,
+        "rule_label": "500/min",
+        "usable": true,
+        "effective_rate": 500,
+        "recommended_interval_ms": 150
       }
     }
   },
@@ -7599,13 +7599,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -7966,13 +7959,6 @@
           "399673.SZ"
         ],
         "date_mode": "daily"
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -10881,6 +10867,11 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
+      },
+      "no_pk": true,
+      "date_col": "trade_date",
+      "upsert": {
+        "partition_key": "trade_date"
       }
     }
   },
@@ -11038,7 +11029,9 @@
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
-        "date_mode": "once"
+        "date_mode": "once",
+        "refresh_days": 7,
+        "refresh_batch_size": 1000
       },
       "no_pk": true,
       "upsert": {
@@ -11187,7 +11180,9 @@
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
-        "date_mode": "once"
+        "date_mode": "once",
+        "refresh_days": 7,
+        "refresh_batch_size": 1000
       }
     }
   },
@@ -11418,7 +11413,9 @@
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
-        "date_mode": "once"
+        "date_mode": "once",
+        "refresh_days": 7,
+        "refresh_batch_size": 1000
       },
       "classification": {
         "rule": 1,
@@ -11533,7 +11530,9 @@
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
-        "date_mode": "once"
+        "date_mode": "once",
+        "refresh_days": 7,
+        "refresh_batch_size": 1000
       },
       "no_pk": true,
       "upsert": {
@@ -13773,7 +13772,8 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
-      }
+      },
+      "pk_override": "(ts_code, con_code, trade_date)"
     }
   },
   {
@@ -14531,6 +14531,11 @@
         "usable": true,
         "effective_rate": 500,
         "recommended_interval_ms": 150
+      },
+      "no_pk": true,
+      "date_col": "trade_date",
+      "upsert": {
+        "partition_key": "trade_date"
       }
     }
   },
@@ -17671,14 +17676,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 2,
-        "rule_label": "100/min",
-        "usable": true,
-        "effective_rate": 100,
-        "recommended_interval_ms": 750,
-        "note": "频率限制100/min（低于标准500）"
       }
     }
   },
@@ -17783,13 +17780,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -18866,13 +18856,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -18937,13 +18920,6 @@
       "param_fixes": {
         "force_required": [],
         "force_disabled": []
-      },
-      "classification": {
-        "rule": 1,
-        "rule_label": "500/min",
-        "usable": true,
-        "effective_rate": 500,
-        "recommended_interval_ms": 150
       }
     }
   },
@@ -22484,7 +22460,9 @@
       "driver": {
         "source_table": "stk_factor_pro",
         "source_column": "ts_code",
-        "date_mode": "once"
+        "date_mode": "once",
+        "refresh_days": 7,
+        "refresh_batch_size": 1000
       },
       "upsert": {
         "partition_key": "ts_code",

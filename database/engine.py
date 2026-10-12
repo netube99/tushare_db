@@ -212,7 +212,7 @@ def connect(db_path: str | None = None, read_only: bool = False,
         if header.startswith(b"SQLite format 3"):
             raise RuntimeError(
                 f"{db_path} 是 SQLite 文件，DuckDB 无法打开；"
-                f"请先运行 scripts/migrate_sqlite_to_duckdb.py 迁移")
+                "请选择 DuckDB 数据库文件")
     raw = duckdb.connect(db_path, read_only=read_only, config=config)
     return Conn(raw, db_path, read_only=read_only)
 
@@ -274,6 +274,20 @@ def unique_constraints(conn: Conn, table: str) -> list[list[str]]:
     except duckdb.Error:
         return []
     return [[str(c) for c in r[0]] for r in rows]
+
+
+def table_constraints(conn: Conn, table: str) -> list[Row]:
+    return conn.execute(
+        "SELECT constraint_type, constraint_text FROM duckdb_constraints() "
+        "WHERE database_name=current_database() AND table_name=?", (table,),
+    ).fetchall()
+
+
+def table_indexes(conn: Conn, table: str) -> list[Row]:
+    return conn.execute(
+        "SELECT index_name, sql FROM duckdb_indexes() "
+        "WHERE database_name=current_database() AND table_name=?", (table,),
+    ).fetchall()
 
 
 def table_exists(conn: Conn, table: str) -> bool:

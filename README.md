@@ -43,10 +43,20 @@ python scripts/maintain.py --daily
 | `python scripts/maintain.py --api <name>` | 只维护单个接口 |
 | `python scripts/maintain.py --since 20150101` | 自定义起始日期 |
 | `python scripts/maintain.py --dry-run` | 预览策略不拉取 |
+| `python scripts/repair_data_contracts.py --tables block_trade,top_list,kpl_concept_cons --restore-cache --dry-run` | 只读预览 DuckDB 明细主键修复与完整缓存恢复 |
+
+旧表主键不符合 `api_index.json` 声明时，维护程序会拒绝写入。修复工具默认只读预览，
+加 `--apply` 才备份并执行；未从完整缓存恢复的日期登记为待重拉，随后需定向重拉并核对。
+备份、执行记录和 `restore.sql` 保存在 `data/contract_repairs/`，应保留用于回滚。
 
 ### 每日自动维护
 
 建库完成后，加入 crontab 即可无人值守运行。脚本内置收盘时间门禁（`pull_after`，默认 20:30 北京时间），盘中运行自动跳过当日。
+
+五张逐股全历史公告表按 `api_index.json` 的 `driver.refresh_days=7`、
+`refresh_batch_size=1000` 刷新到期域，每表每轮最多 1000 个。7 天是最小刷新间隔，
+实际轮转时间取决于域数量、运行频率、失败和冷却。完整空响应替换为当前空快照，
+分页不完整或请求失败保留旧分区并登记失败。国家队和养老金派生表需在源表更新后手动重建。
 
 ```bash
 # 每个交易日 21:00 执行每日更新
@@ -54,6 +64,9 @@ python scripts/maintain.py --daily
 ```
 
 ### Qlib 转换
+
+Qlib 当前存在已确认未修复的问题：历史修订同步、日历索引变更、转债 VWAP 单位和
+多输出目录状态隔离。启用对应消费路径前需按[问题台账](docs/code-quality-baseline.md)验收。
 
 ```bash
 python scripts/convert_to_qlib.py                  # 全量转换（中断自动续转）
@@ -140,8 +153,11 @@ tushare_db/
 │   ├── maintain.py             # 建库 / 日更 / 清理 / 质检
 │   ├── classify_apis.py        # 接口分级
 │   ├── generate_schema.py      # Schema + REGISTRY 生成
-│   ├── migrate_sqlite_to_duckdb.py  # SQLite → DuckDB 一次性迁移
+│   ├── repair_data_contracts.py # DuckDB 明细主键修复 / 缓存恢复 / 备份
+│   ├── refresh_national_team_daily.py # 国家队派生表
+│   ├── refresh_pension_daily.py # 养老金派生表
 │   └── convert_to_qlib.py      # Qlib 转换 CLI 入口
+├── docs/code-quality-baseline.md # 固定问题台账与修复验收记录
 ├── qlib_export/                # Qlib 转换引擎子模块
 │   ├── specs.py                # TABLE_SPECS + 字段映射
 │   ├── sync_log.py             # bin_sync_log 状态机
@@ -150,7 +166,7 @@ tushare_db/
 │   ├── binio.py                # bin 原子读写
 │   ├── features.py             # FeatureSync 全量转换
 │   └── incremental.py          # IncrementalSync + FieldRebuilder
-├── tests/                      # 313 tests, pytest
+├── tests/                      # 离线回归与数据契约验收，pytest
 │   ├── test_pure.py            # 纯函数单测
 │   ├── test_state_machine.py   # 状态机单测
 │   ├── test_integration.py     # mock 集成测试
@@ -163,5 +179,8 @@ tushare_db/
 ## 测试
 
 ```bash
-pytest tests/ -v    # 313 tests，无需真实数据库
+uv run pytest tests/ -q    # 无需真实数据库或 Tushare 连接
 ```
+
+当前验收结果为 346 passed、0 failed、5 xfailed。五个严格 xfail 对应台账中
+尚未修复的 Qlib 问题，不计为通过；SQLite 迁移功能已移除，当前运行栈仅使用 DuckDB。

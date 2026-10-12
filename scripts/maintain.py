@@ -141,20 +141,36 @@ def _find_entry(table: str | None = None, api: str | None = None) -> dict | None
 
 
 def _pull_and_store(conn, table: str, df, date_val: str,
-                    api_name: str, strategy: str, log_prefix: str = "") -> bool:
+                    api_name: str, strategy: str, log_prefix: str = "",
+                    partition: tuple[str, list] | None = None) -> bool:
     """统一拉取结果写入：upsert + pull_log。
 
     Returns: True=成功, False=需重试.
     """
-    if df is not None and not df.empty:
-        try:
-            entry = _find_entry(table=table)
-            pkey = entry.get("partition_key") if entry else None
+    try:
+        entry = _find_entry(table=table)
+        if entry and "primary_key" in entry:
+            from database import engine
+            actual_pk = engine.primary_key_cols(conn, table)
+            if set(actual_pk) != set(entry["primary_key"]):
+                raise RuntimeError(
+                    f"{table} 主键不符合接口粒度: {actual_pk} → {entry['primary_key']}；"
+                    "先运行 scripts/repair_data_contracts.py 预览并迁移旧表")
+        pkey = entry.get("partition_key") if entry else None
+        if df is not None and not df.empty:
             # 分区替换：先删本域旧行，再插入（无主键表避免重复堆积）；
             # DELETE 与 INSERT 在 upsert_df 内同事务，失败整体回滚
-            pre_delete = None
-            if pkey and pkey in df.columns:
+            pre_delete = partition
+            if partition is not None:
+                col, values = partition
+                if (col not in df.columns or df[col].isna().any()
+                        or not set(df[col].astype(str)).issubset({str(v) for v in values})):
+                    raise ValueError(f"{table} 响应与请求分区 {partition} 不一致")
+            elif pkey and pkey in df.columns:
                 pre_delete = (pkey, [str(c) for c in df[pkey].unique()])
+            declared_pk = entry.get("primary_key", []) if entry else []
+            if any(c not in df.columns or df[c].isna().any() for c in declared_pk):
+                raise ValueError(f"{table} 响应缺少有效唯一键，拒绝丢行后登记成功")
             n = upsert_df(conn, table, df,
                           drop_null_pk=not bool(entry and entry.get("null_pk_keep")),
                           replace_all=not bool(entry and entry.get("partition_key")),
@@ -163,14 +179,15 @@ def _pull_and_store(conn, table: str, df, date_val: str,
             logger.info(f"{log_prefix}{table}: {n} rows")
             log_pull(conn, table, date_val, 1, api=api_name, rows=n, strategy=strategy)
             return True
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"[maintain] {api_name} 写入异常: {e}")
-            log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
-            return False
-    else:
+        if df is not None and partition is not None:
+            upsert_df(conn, table, df, replace_all=False, pre_delete=partition)
         log_pull(conn, table, date_val, 2, api=api_name, strategy=strategy)
         return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[maintain] {api_name} 写入异常: {e}")
+        log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
+        return False
 
 
 def _pull_once(conn, dc, entry, date_val: str, strategy: str, pfx: str,
@@ -195,7 +212,9 @@ def _pull_once(conn, dc, entry, date_val: str, strategy: str, pfx: str,
         logger.error(f"{pfx}{name} 调用异常: {e}")
         log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
         return False
-    return _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx)
+    pkey = entry.get("partition_key")
+    partition = (pkey, [kwargs[pkey]]) if pkey and pkey in kwargs else None
+    return _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx, partition)
 
 
 def _done_count(conn, table: str, date_val: str,
@@ -222,7 +241,7 @@ def _cal_query(conn, select="cal_date", since=None, until=None,
 
 
 def _dispatch_strategy(conn, dc, entry, strategy=None, since=None, until=None,
-                       *, progress=None, filter_date_val=None):
+                       *, progress=None, filter_date_val=None, refresh_done=False):
     """统一策略分派器。since/until 为 None 时由各策略函数自行决定."""
     if strategy is None:
         strategy = _get_date_params(entry)
@@ -236,7 +255,7 @@ def _dispatch_strategy(conn, dc, entry, strategy=None, since=None, until=None,
         _run_date_range_strategy(conn, dc, entry, since, until, progress=progress)
     elif strategy["strategy"] == "domain":
         _run_domain_strategy(conn, dc, entry, since, until, progress=progress,
-                            filter_date_val=filter_date_val)
+                            filter_date_val=filter_date_val, refresh_done=refresh_done)
     else:
         _run_once_strategy(conn, dc, entry, progress=progress)
 
@@ -461,9 +480,54 @@ def _apply_param_fixes(api: dict) -> dict:
     return {"active_params": active, "is_required": is_required}
 
 
+def _domain_refresh_queue(conn, entry: dict, domain_vals: list) -> tuple[list, set[str], set[str]]:
+    driver = entry["driver"]
+    refresh_days = driver["refresh_days"]
+    budget = driver["refresh_batch_size"]
+    if (not isinstance(refresh_days, int) or refresh_days < 1
+            or not isinstance(budget, int) or budget < 1):
+        raise ValueError("driver.refresh_days/refresh_batch_size 必须为正整数")
+    now = beijing_now()
+    cutoff = now - timedelta(days=refresh_days)
+    records = {r["date_val"]: r for r in conn.execute(
+        "SELECT date_val,ok,last_try,retry_count FROM pull_log WHERE table_name=?",
+        (entry["table"],),
+    ).fetchall()}
+    candidates = []
+    oldest = datetime.min.replace(tzinfo=now.tzinfo)
+    for dv in domain_vals:
+        key = f"{dv}__once__"
+        record = records.get(key)
+        last_try = oldest
+        if record:
+            if record["ok"] == 3:
+                continue
+            if record["ok"] == 0 and record["retry_count"] >= 5:
+                conn.execute("UPDATE pull_log SET ok=3 WHERE table_name=? AND date_val=?",
+                             (entry["table"], key))
+                continue
+            try:
+                parsed = datetime.fromisoformat(record["last_try"])
+                last_try = parsed if parsed.tzinfo else parsed.replace(tzinfo=now.tzinfo)
+            except (ValueError, TypeError):
+                pass
+            if record["ok"] in (1, 2) and last_try > cutoff:
+                continue
+        candidates.append((last_try, str(dv), dv, record))
+    conn.commit()
+    candidates.sort(key=lambda item: item[:2])
+    selected = candidates[:budget]
+    logger.info(f"[daily] {entry['api']}: 到期/未完成域 {len(candidates)}，本轮 {len(selected)}，"
+                f"刷新最小间隔 {refresh_days} 天")
+    refresh_keys = {f"{dv}__once__" for _, _, dv, record in selected if record}
+    retry_keys = {f"{dv}__once__" for _, _, dv, record in selected
+                  if record and record["ok"] == 0}
+    return [item[2] for item in selected], refresh_keys, retry_keys
+
+
 def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                          progress: tuple[int, int] | None = None,
-                         filter_date_val: str | None = None):
+                         filter_date_val: str | None = None, refresh_done: bool = False):
     """domain 策略：逐域值 × 逐日期周期拉取.
 
     Args:
@@ -520,6 +584,11 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 logger.error(f"{_pfx}{api_name}: 驱动表 {source_table} 仍无数据，跳过")
                 return
 
+    refresh_keys: set[str] = set()
+    retry_keys: set[str] = set()
+    if refresh_done and date_mode == "once" and "refresh_days" in driver:
+        domain_vals, refresh_keys, retry_keys = _domain_refresh_queue(conn, entry, domain_vals)
+
     # 2. 获取日期周期
     periods = _get_date_periods(conn, date_mode, since, until)
     if not periods:
@@ -555,7 +624,7 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 ok_filter = "ok IN (1,2)"
             else:
                 ok_filter = "ok=1"
-            if _done_count(conn, table, date_val, ok_filter):
+            if date_val not in refresh_keys and _done_count(conn, table, date_val, ok_filter):
                 skipped += 1
                 continue
 
@@ -565,6 +634,8 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 kwargs["end_date"] = period[2]
             elif date_mode == "daily":
                 kwargs["trade_date"] = period[0]
+            if date_val in refresh_keys:
+                kwargs["force_refresh"] = True
             # once: 不传日期参数
 
             logger.info(f"{_pfx}{api_name}({param_name}={dv}, period={period_key}) → {table}")
@@ -574,6 +645,17 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 logger.info(f"{_pfx}{api_name}: {filled} 次拉取, {skipped} 跳过, "
                             f"共 {len(domain_vals)} 域 × {len(periods)} 周期（限流中断）")
                 return
+            if refresh_done and date_mode == "once" and "refresh_days" in driver:
+                if res:
+                    conn.execute("UPDATE pull_log SET retry_count=0 WHERE table_name=? AND date_val=?",
+                                 (table, date_val))
+                elif date_val in retry_keys:
+                    conn.execute("UPDATE pull_log SET retry_count=retry_count+1 "
+                                 "WHERE table_name=? AND date_val=?", (table, date_val))
+                else:
+                    conn.execute("UPDATE pull_log SET retry_count=0 WHERE table_name=? AND date_val=?",
+                                 (table, date_val))
+                conn.commit()
             filled += 1
 
     logger.info(f"{_pfx}{api_name}: {filled} 次拉取, {skipped} 跳过, "
@@ -1035,7 +1117,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 逐域刷新")
             _dispatch_strategy(conn, dc, entry, strategy,
                                config.get("backfill_since", DEFAULT_BACKFILL_SINCE),
-                               target_str, progress=p)
+                               target_str, progress=p, refresh_done=True)
             logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
             continue
 
@@ -1101,6 +1183,10 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             entry = _find_entry(table=table)
             if not entry:
                 logger.warning(f"[daily] {table} 不在 REGISTRY，跳过")
+                continue
+            driver = entry.get("driver", {})
+            if driver.get("date_mode") == "once" and "refresh_days" in driver:
+                # 已由有预算的域队列处理，避免本轮第二次重试或绕过队列预算。
                 continue
             if retry_count >= MAX_RETRY_ATTEMPTS:
                 logger.warning(f"[daily] {table} {date_val}: 已达最大重试次数 {MAX_RETRY_ATTEMPTS}，标记放弃 (ok=3)")

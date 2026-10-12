@@ -9,6 +9,76 @@ tushare_db：Tushare_Pro → DuckDB → Qlib 数据管道。
 
 ---
 
+## 收敛规则（开发、审查、修复必须遵守）
+
+本项目已经投入使用，默认处于维护阶段。目标是稳定的数据契约和可验证的正确性。
+审查基线与问题台账见 [docs/code-quality-baseline.md](docs/code-quality-baseline.md)。
+用户目前直接读取 DuckDB；优先级按实际消费路径判断，启用 Qlib 前单独验收其已登记问题。
+
+### 1. 先确定任务边界
+
+- 开始时检查 `git status`、相关台账和消费路径，保留用户已有改动。审查以工作区现状为准，记录基线；不能只审 HEAD 而忽略未提交配置。
+- “审查”默认产出证据、风险判断与关闭条件；功能修复按用户授权执行。“优化”必须说明改善的指标和验收标准。
+- 未明确要求时，不增加功能、升级依赖、换架构、全仓格式化、批量重构或引入新工具链。
+- 每次修复围绕一个根因或紧密相关的一组契约展开。发现旁支问题登记后继续当前任务；有证据的严重问题必须报告，但不能借此无限扩大修改范围。
+
+### 2. 缺陷准入：没有证据，不进入修复清单
+
+每个缺陷必须给出以下信息，缺一则标为“待验证”，不得宣称已确认或自动修复：
+
+1. 具体触发条件与项目内可到达的调用路径。
+2. 违反的契约及其依据（接口元数据、现有明确约定、官方资料或用户需求）。
+3. 最小复现或实测证据，包括预期值、实际值和代码位置。
+4. 对数据/使用者的影响，以及影响的是 DuckDB、派生表还是 Qlib。
+5. 固定问题编号、修复范围和可执行的关闭条件。
+
+分级必须与证据一致：
+
+| 级别 | 判断依据 | 处理 |
+|---|---|---|
+| P0 | 有证据的正在发生的大范围数据破坏或不可恢复损失 | 立即报告，优先控制影响 |
+| P1 | 可复现的丢行、错误计算、错误日期对齐、遗漏更新或失败冒充成功 | 在受影响路径的正确性验收前关闭 |
+| P2 | 可复现、影响局部且不改变有效数据结果的运行/诊断问题 | 登记，按授权处理 |
+| 可选改进 | 风格、偏好、抽象、潜在性能或假设风险 | 用户未要求时不列为缺陷、不实施 |
+
+- 报警文字、静态分析提示、代码“看起来不够优雅”、没有证明可发生的边界，不能单独构成 P0/P1。
+- 业务口径未明确时记录“待确认的契约”，先说明几种选择如何改变结果；不得擅自选择口径并包装成修 bug。
+- 不设缺陷数量配额；有新证据就报告，不能为了收敛隐藏严重问题。
+
+### 3. 数值和数据完整性是硬契约
+
+- 涉及数值/导出/聚合的改动，必须明确：行粒度、唯一键、字段单位、复权口径、NULL/零的含义、事件有效日期、修订数据如何传播。
+- 主键必须符合接口真实行粒度；不能仅凭“有 ts_code 和 trade_date”断言它们唯一。明细的多笔、多理由、多成分行需要保留；没有可靠唯一键时不能猜键或随意去重。
+- 聚合必须明确报告期与方向；不能把同一披露日的多个报告期累计成一份当前持仓，也不能把减持直接当增持相加。加权计算需要说明缺值如何进入分子、分母。
+- 单位换算必须从源字段单位推导，禁止跨股票、基金、转债机械套常数。原始字段与复权字段必须可区分，不能将一张表所有数值统一标记为同一复权口径。
+- `ann_date`、报告期、除权日、交易日分别说明含义；仅有日期不能证明盘前已知。交易策略可用时点由消费契约决定，不得凭日期对齐宣称无未来信息。
+- 正常空返回、完整成功、部分返回、失败必须区分。部分分页不能登记为完整成功，不能用不完整结果替换既有完整分区；计数相同不能证明数值未修订。
+- 全量、增量、续跑、重复执行在约定的修订范围内应得到一致数据。日历索引变动必须完整重建或在写入前拒绝，不能只警告后继续混用旧 bin。
+- 测试通过、`pull_log ok=1`、`bin_sync_log done`、`--verify` 日期覆盖率，均不能单独作为金融计算正确性或全市场完整性的证明。
+
+### 4. 修复必须闭环，禁止顺手改造
+
+- 已确认的正确性问题先写可失败的行为用例，再作最小修复；预期值用手算、固定样本或独立参考推导，不能调用被测实现生成答案。
+- 保存正常对照样例，验证修复没有改变已有正确行为。低影响文档/样式修改不堆砌测试。
+- 不通过放宽断言、吞异常、提高重试次数、增加 skip/xfail 或降低阈值使修复“通过”。既有测试若维护了错误口径，必须指出契约冲突并同步纠正。
+- 接口差异在 `api_index.json` 修正；生成物通过生成器更新。Schema/REGISTRY 一致并不证明主键正确。
+- 主键、约束、类型和分区方式改变后，要验证已有库的实际结构；`CREATE IF NOT EXISTS` 和补列不会迁移旧主键。
+- 已落库数据受错误影响时，闭环必须包括：受影响表/日期、旧库迁移、定向重拉或恢复、相关派生表/导出重建及新旧样本核对。仅代码修好不得写“历史数据已修复”。
+- 审查与本地测试使用内存库/临时目录，不请求真实 Tushare、不重跑生产维护、不清缓存、不 reset、不迁移生产库。必要抽样用共享锁和只读连接，库忙则跳过并报告；生产写入依据用户实际授权，已有授权不重复索取。
+- 先跑针对性用例，再跑 `uv run pytest tests/ -q`；涉及生成链时在临时副本或内存中验证产物。通过后不因没有新证据而反复扩大测试或修改。
+
+### 5. 用固定台账管理审查，明确结束条件
+
+- 后续审查先读台账并运行相关用例。相同根因使用同一编号；不得每轮换标题把同一件事当新发现。
+- 状态使用“已确认未修复 / 待验证 / 已关闭 / 已接受限制”，同时写适用路径。只有用户明确接受才能标为已接受限制；暂不使用某模块不等于其缺陷消失。
+- 重新打开已关闭问题必须提供新触发条件、回归证据或契约变更。没有这些证据，不再要求同一位置重复“优化”。
+- 审查范围内可复现问题已登记、验证结果及未覆盖范围已说明，审查任务即结束。一次修复的约定验收通过、相关旧数据处置状态写明后，修复任务即结束，不追加“还能进一步优化”。
+- 当前使用路径的 P0/P1 未关闭时，不能宣称该路径已达到正确性验收；不用追求全仓零警告、零建议或对所有假设输入绝对正确。
+- 本轮仅审查留下的 `tests/test_audit_contracts.py` 使用 `strict=True, raises=AssertionError` 的 xfail，是未修复证据，不是正常通过或风险接受。修复对应编号后移除标记、更新台账；不得复制此做法掩盖新代码回归。
+- 交付说明必须区分：改了什么、实际验证了什么、还未修复/未验证什么。可以如实写“没有新的已确认缺陷”。
+
+---
+
 ## 命令
 
 ```bash
@@ -35,6 +105,9 @@ python scripts/maintain.py --cleanup --vacuum
 # 重拉单表单日
 python scripts/maintain.py --refresh <API> <DATE>
 
+# 只读预览明细旧主键迁移与缓存恢复（--apply 才写库，执行前备份）
+python scripts/repair_data_contracts.py --tables block_trade,top_list,kpl_concept_cons --restore-cache --dry-run
+
 # 预览策略不拉取
 python scripts/maintain.py --dry-run
 
@@ -50,10 +123,6 @@ python scripts/convert_to_qlib.py --fields open,high
 # 重新生成接口分类 / Schema（积分变化后）
 python scripts/classify_apis.py
 python scripts/generate_schema.py
-
-# SQLite → DuckDB 一次性数据迁移（--dry-run 预览 / --resume 续迁）
-python scripts/migrate_sqlite_to_duckdb.py --dry-run
-python scripts/migrate_sqlite_to_duckdb.py
 
 # 测试（无需真实数据库）
 pytest tests/ -v
@@ -109,7 +178,7 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 - 元数据：`PRAGMA table_info` 可用；表清单用 `duckdb_tables()`，主键用 `duckdb_constraints()`。
 - 空间回收用 `CHECKPOINT`（`VACUUM` 不回收）；彻底压实用 EXPORT/IMPORT 重写。
 - `ALTER TABLE ADD COLUMN` 不支持带约束，迁移仅补可空列。
-- 遗留 SQLite 文件由 `scripts/migrate_sqlite_to_duckdb.py` 一次性迁移（源库只读附加）。
+- 当前仅支持 DuckDB 数据库文件，无 SQLite 驱动、读写或迁移路径；连接时仅用文件头校验拒绝误传的旧格式文件。
 
 ---
 
@@ -163,8 +232,8 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 - **全局 token 级**：`_last_call_global`，确保任意两次请求间最小间隔 `60 / tushare_rate_limit`
 - **per-API 级**：`_last_call[api_name]`，低频 API 更长间隔
 - 间隔计算：`floor = 60 / tushare_rate_limit`，0.8 安全裕度内置于 `recommended_interval_ms`
-- 分页终止条件：返回行数 < `max_rows`；offset 超限时 Tushare 部分接口返回业务错误
-  （如 pledge_detail 超 10 万行 50101）→ 保留已拉数据而非整表丢弃
+- 分页终止条件：返回行数 < `max_rows`；中页业务错误、重复首页或页数上限
+  → 抛 IncompleteFetchError，partial_df 仅供诊断，不完整响应不替换旧分区、不登记成功
 - `_rate_lock` 包裹限速临界区，线程安全
 
 ### 天级限流冷却（40203）
@@ -253,7 +322,15 @@ subprocess 容错：classify/generate 失败时记录 error 日志，降级沿�
 （覆盖退市股）+ `force_required=["dividend.ts_code"]`（注意带 api 前缀）逐股全量拉取，
 才能拿到按 ann_date 逐日拉取永远丢失的多阶段行与 `ann_date=NULL` 行。
 `stk_holdernumber`/`stk_holdertrade`/`pledge_detail` 同款：无主键（`_project.no_pk`）+
-`partition_key=ts_code` 分区替换（DELETE 本域旧行再插入），上游同日多公告/无唯一列时零丢失。
+`partition_key=ts_code` 分区替换（DELETE 本域旧行再插入），保留同日多公告/无唯一列的明细行。
+这五张 domain-once 表通过 driver.refresh_days=7、refresh_batch_size=1000 配置，
+daily 按上次尝试时间从旧到新处理到期域和未完成域，每表每轮最多 1000 个；
+7 天是最小刷新间隔，实际轮转时间还受域数量、运行频率、预算和冷却影响。
+刷新已有记录时强制绕过缓存；backfill 仍保留已完成域的续跑语义。
+分页中断/重复首页/页数上限抛 IncompleteFetchError，策略登记 ok=0 并保留旧分区。
+DB-001～005 的代码已离线验收，本次生产明细迁移、历史恢复、到期公告轮转、
+国家队/养老金派生重建及样本核对已完成。上游新空返回的旧增减持快照已归档，
+当前快照与历史归档的消费边界、未覆盖范围和证据见审查台账。
 
 domain 周期边界：backfill 用 `--since`，daily 传配置 `backfill_since`（不再传 `None` 全历史扫描）。
 驱动表为空时（全新库首轮，驱动表在 REGISTRY 中可能排在本表之后）按驱动表自身策略补拉
@@ -391,10 +468,12 @@ tests/test_qlib_review.py     — qlib_export 审查回归（bin 格式、增量
 tests/test_schema_gen_review.py — schema 生成链审查回归（分级、主键推断、保留字、REGISTRY 注入）
 tests/test_config_review.py   — 配置与辅助脚本审查回归（模板键一致性、派生表原子替换）
 tests/test_duckdb_review.py   — DuckDB 引擎回归（Row/Result/锁/事务/可空主键/TryCast/元数据）
-tests/test_migrate_review.py  — 迁移脚本回归（进度隔离、完成判定、原子写）
+tests/test_audit_contracts.py — 固定编号审查证据及独立计算对照（含严格 xfail，见台账）
+tests/test_contract_fixes.py — DB-001～005 修复验收与旧库迁移/备份恢复回归
 ```
 
-313 tests，不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
+测试不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。
+数量以实际运行结果为准；必须分别报告 passed / failed / xfailed，不把未修复证据算作通过。
 
 ---
 

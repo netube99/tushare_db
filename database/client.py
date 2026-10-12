@@ -31,6 +31,14 @@ class DailyLimitError(TushareError):
     pass
 
 
+class IncompleteFetchError(TushareError):
+    """分页未完成；部分页仅供诊断，不能作为完整分区落库。"""
+
+    def __init__(self, code, msg: str, partial_df: pd.DataFrame):
+        self.partial_df = partial_df
+        super().__init__(code, msg)
+
+
 class DataClient:
     """Tushare 数据客户端 + pickle 缓存.
 
@@ -228,32 +236,35 @@ class DataClient:
     ) -> pd.DataFrame:
         """offset 递增分页拉取全部数据。"""
         all_dfs = []
-        first_page_fingerprint = None
+        first_page = None
         for page in range(200):
             page_kwargs = {**kwargs, "limit": max_rows, "offset": page * max_rows}
             try:
                 df = self._request_single(api_name, page_kwargs, force_refresh)
             except TushareError as e:
-                # DailyLimitError 始终上抛；其余业务错误（如 pledge_detail 超
-                # 10 万行 50101）在已有数据时保留，避免整表丢弃；
-                # 一页未拉到则向上抛，由调用方记 ok=0 重试，不与正常空返回混淆
                 if not all_dfs or isinstance(e, DailyLimitError):
                     raise
-                logger.warning(
-                    f"[{api_name}] offset={page * max_rows} 分页中断: {e}，"
-                    f"保留已拉 {sum(len(d) for d in all_dfs)} 行")
-                break
+                raise IncompleteFetchError(
+                    e.code, f"{api_name} offset={page * max_rows} 分页未完成: {e.msg}",
+                    pd.concat(all_dfs, ignore_index=True),
+                ) from e
             if df.empty:
                 break
-            fingerprint = str(df.iloc[0].to_dict())
             if page == 0:
-                first_page_fingerprint = fingerprint
-            elif fingerprint == first_page_fingerprint:
-                logger.warning(f"[{api_name}] offset={page*max_rows} 重复首页数据，终止分页")
-                break
+                first_page = df
+            elif df.reset_index(drop=True).equals(first_page.reset_index(drop=True)):
+                raise IncompleteFetchError(
+                    -1, f"{api_name} offset={page * max_rows} 重复首页，无法确认完整性",
+                    pd.concat(all_dfs, ignore_index=True),
+                )
             all_dfs.append(df)
             if len(df) < max_rows:
                 break
+        else:
+            raise IncompleteFetchError(
+                -1, f"{api_name} 达到 200 页上限，分页未完成",
+                pd.concat(all_dfs, ignore_index=True),
+            )
 
         if not all_dfs:
             return pd.DataFrame()

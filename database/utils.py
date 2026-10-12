@@ -161,8 +161,13 @@ def upsert_df(conn: Connection, table: str, df: pd.DataFrame,
     dedupe_cols: 仅做批内去重（keep=last），用于无约束表。
     pre_delete: (列, 值列表)，先删目标分区再插入，保证幂等与原子性。
     """
+    was_empty = df.empty
     df = df.dropna(how="all")
     if df.empty:
+        if pre_delete is not None:
+            if not was_empty:
+                raise ValueError("分区响应所有行均无有效值，拒绝清空旧分区")
+            _replace_empty_partition(conn, table, pre_delete)
         return 0
 
     table_cols = engine.table_columns(conn, table)
@@ -230,6 +235,23 @@ def upsert_df(conn: Connection, table: str, df: pd.DataFrame,
     finally:
         conn.unregister("_incoming_df")
     return len(df)
+
+
+def _replace_empty_partition(conn: Connection, table: str,
+                             pre_delete: tuple[str, list]) -> None:
+    col, values = pre_delete
+    if col not in engine.table_columns(conn, table):
+        raise ValueError(f"{table} 不存在分区列 {col}")
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute(
+            f"DELETE FROM {engine._quote_ident(table)} "
+            f"WHERE {engine._quote_ident(col)} IN (SELECT unnest(?))", [list(values)],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _cast_expr(col: str, col_type: str) -> str:

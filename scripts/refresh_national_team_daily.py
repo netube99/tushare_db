@@ -88,66 +88,43 @@ def load_events(conn: Connection) -> pd.DataFrame:
     从未被持有的股票的披露期不是退出事件；已退出后的后续披露期也不再重复
     生成退出（state 已为 0）。重新进入 = 新的在榜事件。
     """
-    present = conn.execute(
+    snapshots = conn.execute(
         f"""
-        SELECT ts_code, ann_date,
-               COUNT(DISTINCT holder_name)                                    AS nt_cnt,
-               SUM(hold_ratio)                                                AS nt_ratio_sum,
-               SUM(hold_float_ratio)                                          AS nt_float_ratio_sum,
-               SUM(hold_change)                                               AS nt_chg_sum,
-               SUM(hold_amount)                                               AS nt_amount_sum,
-               SUM(CASE WHEN hold_change IS NULL THEN 1 ELSE 0 END)           AS nt_new_cnt,
-               1                                                              AS nt_state
-        FROM top10_floatholders
-        WHERE ann_date IS NOT NULL AND {NT_WHERE}
-        GROUP BY ts_code, ann_date
+        WITH named AS (
+            SELECT *, ({NT_WHERE}) AS is_nt
+            FROM top10_floatholders WHERE ann_date IS NOT NULL
+        ), per_period AS (
+            SELECT ts_code, ann_date, end_date,
+                   COUNT(DISTINCT CASE WHEN is_nt THEN holder_name END) AS nt_cnt,
+                   SUM(CASE WHEN is_nt THEN hold_ratio END) AS nt_ratio_sum,
+                   SUM(CASE WHEN is_nt THEN hold_float_ratio END) AS nt_float_ratio_sum,
+                   SUM(CASE WHEN is_nt THEN hold_change END) AS nt_chg_sum,
+                   SUM(CASE WHEN is_nt THEN hold_amount END) AS nt_amount_sum,
+                   SUM(CASE WHEN is_nt AND hold_change IS NULL THEN 1 ELSE 0 END) AS nt_new_cnt
+            FROM named GROUP BY ts_code, ann_date, end_date
+        ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY ts_code, ann_date ORDER BY end_date DESC NULLS LAST
+            ) AS rn FROM per_period
+        ), latest AS (
+            SELECT *, MAX(end_date) OVER (
+                PARTITION BY ts_code ORDER BY ann_date
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS known_period FROM ranked WHERE rn=1
+        )
+        SELECT ts_code, ann_date, nt_cnt,
+               CASE WHEN nt_cnt=0 THEN 0 ELSE nt_ratio_sum END AS nt_ratio_sum,
+               CASE WHEN nt_cnt=0 THEN 0 ELSE nt_float_ratio_sum END AS nt_float_ratio_sum,
+               CASE WHEN nt_cnt=0 THEN 0 ELSE nt_chg_sum END AS nt_chg_sum,
+               CASE WHEN nt_cnt=0 THEN 0 ELSE nt_amount_sum END AS nt_amount_sum, nt_new_cnt,
+               CASE WHEN nt_cnt > 0 THEN 1 ELSE 0 END AS nt_state
+        FROM latest WHERE end_date=known_period OR known_period IS NULL
         ORDER BY ts_code, ann_date
         """
     ).df()
-    disc = conn.execute(
-        """
-        SELECT ts_code, end_date, MIN(ann_date) AS ann_date
-        FROM top10_floatholders
-        WHERE ann_date IS NOT NULL AND end_date IS NOT NULL
-        GROUP BY ts_code, end_date
-        """
-    ).df()
-
-    present_keys = set(zip(present["ts_code"], present["ann_date"]))
-    present_anns: dict[str, set[str]] = {}
-    for ts, ann in present_keys:
-        present_anns.setdefault(ts, set()).add(ann)
-
-    disc_anns: dict[str, set[str]] = {}
-    for ts, ann in zip(disc["ts_code"], disc["ann_date"]):
-        disc_anns.setdefault(ts, set()).add(ann)
-
-    exit_rows = []
-    for ts in sorted(set(disc_anns) | set(present_anns)):
-        anns = sorted(disc_anns.get(ts, set()) | present_anns.get(ts, set()))
-        state = 0
-        for ann in anns:
-            if (ts, ann) in present_keys:
-                state = 1
-            elif state == 1:
-                state = 0
-                exit_rows.append(
-                    {
-                        "ts_code": ts,
-                        "ann_date": ann,
-                        "nt_cnt": 0,
-                        "nt_ratio_sum": 0.0,
-                        "nt_float_ratio_sum": 0.0,
-                        "nt_chg_sum": pd.NA,
-                        "nt_amount_sum": 0.0,
-                        "nt_new_cnt": 0,
-                        "nt_state": 0,
-                    }
-                )
-
-    return pd.concat(
-        [present, pd.DataFrame(exit_rows, columns=present.columns)], ignore_index=True
-    ).drop_duplicates(subset=["ts_code", "ann_date"], keep="first")
+    # 同日只用最新报告期；迟到的旧报告不覆盖已知的新期持仓。
+    previous = snapshots.groupby("ts_code")["nt_state"].shift(fill_value=0)
+    return snapshots.loc[(snapshots["nt_state"] == 1) | (previous == 1)].reset_index(drop=True)
 
 
 def build(conn: Connection, stale_days: int) -> pd.DataFrame:

@@ -17,7 +17,7 @@ import pytest
 import requests
 
 import database.logger as dlog
-from database.client import DataClient, TushareError, DailyLimitError
+from database.client import DataClient, TushareError, DailyLimitError, IncompleteFetchError
 
 
 # ── fixtures & helpers ──
@@ -157,9 +157,10 @@ def test_offset_pagination_detects_duplicate_first_page(fake_client, monkeypatch
     monkeypatch.setattr(fake_client, "_request_single",
                         lambda api_name, kwargs, force_refresh=False:
                         calls.append(kwargs["offset"]) or pd.DataFrame(rows))
-    df = fake_client._paginate_offset("fake_api", {}, 2, False)
+    with pytest.raises(IncompleteFetchError, match="重复首页") as error:
+        fake_client._paginate_offset("fake_api", {}, 2, False)
     assert calls == [0, 2]
-    assert len(df) == 2
+    assert len(error.value.partial_df) == 2
 
 
 # ── B. 分页错误语义（契约：瞬时故障与正常空返回严格区分）──
@@ -180,8 +181,10 @@ def test_paginate_offset_mid_page_error_keeps_partial(fake_client, monkeypatch):
         raise TushareError(50101, "单次请求行数超限")
 
     monkeypatch.setattr(fake_client, "_request_single", fake_rs)
-    df = fake_client._paginate_offset("fake_api", {}, 1000, False)
-    assert len(df) == 1000
+    with pytest.raises(IncompleteFetchError) as error:
+        fake_client._paginate_offset("fake_api", {}, 1000, False)
+    assert error.value.code == 50101
+    assert len(error.value.partial_df) == 1000
 
 
 def test_paginate_offset_mid_page_daily_limit_propagates(fake_client, monkeypatch):
