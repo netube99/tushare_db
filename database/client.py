@@ -163,6 +163,13 @@ class DataClient:
     def _request_single(
         self, api_name: str, kwargs: dict, force_refresh: bool = False
     ) -> pd.DataFrame:
+        from database.run_context import log_context, safe_params
+        with log_context(request_params=safe_params(kwargs), force_refresh=force_refresh):
+            return self._request_single_impl(api_name, dict(kwargs), force_refresh)
+
+    def _request_single_impl(
+        self, api_name: str, kwargs: dict, force_refresh: bool = False
+    ) -> pd.DataFrame:
         """单次 Tushare 请求 + pickle 缓存。"""
         t_start = time.time()
         fields = kwargs.pop("fields", "")
@@ -345,6 +352,8 @@ class DataClient:
     def _fetch_with_retry(self, req_params, api_name, max_retries: int = 3) -> tuple:
         for attempt in range(max_retries):
             try:
+                from database.run_context import count
+                count("http_attempts")
                 res = self._session.post(self._url, json=req_params, timeout=self._timeout,
                                          proxies=self._proxies)
             except requests.RequestException as e:

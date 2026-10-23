@@ -158,7 +158,8 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 
 - `classify_apis.py` 读 `api_index.json` → 写 `_project.classification`，不依赖 database/
 - `generate_schema.py` 读 classification → 写 `schema.sql` + 重写 `etl.py`，不依赖 client/
-- `maintain.py` 通过 subprocess 调用前两者，拉取后 `importlib.reload(etl)` 热加载 REGISTRY
+- `maintain.py` 通过 `scripts/_runtime.py` 调用分类/生成纯函数；先校验候选，再按需发布产物，
+  本轮使用同一份配置、接口元数据、Schema 和 REGISTRY，不通过 subprocess/reload 加载
 - `convert_to_qlib.py` 是瘦 CLI，委托 `qlib_export/` 子模块
 - `qlib_export/` 通过 `get_conn()` 直连 market.duckdb，不经过 DataClient
 - `database/engine.py` 是唯一的连接/行访问/元数据/跨进程锁层，业务代码不直接 import duckdb
@@ -245,6 +246,9 @@ JsonLogger ──→ logs/maintain_YYYYMMDD.log (JSON Lines)
 ### pickle 缓存
 
 按请求参数 `json.dumps(sort_keys=True)` 的 SHA256 缓存到 `cache/tushare/<api_name>/<key>.pkl`。TTL 7 天。`force_refresh=True` 绕过。
+续跑允许缓存；人工 `--refresh`、daily 的 once/年度主动刷新、基础信息刷新、
+空返回复验和失败自动修复显式绕过缓存。公告到期刷新沿用已有绕缓存策略。
+不增加历史修订扫描窗口；已完成的日频历史分区仍遵循现有续跑语义。
 
 ### 容错
 
@@ -287,14 +291,15 @@ DDL 生成规则：
 ```
 main()
   │
-  ├─ 加载 config → DataClient(token) → get_conn()
+  ├─ 加载 config → DataClient(token) → 取锁
+  ├─ daily/backfill: prepare_runtime（内存分类/生成/校验，变化时发布）
+  ├─ get_conn（daily/backfill 暂不初始化 schema）
   ├─ run_start 日志（北京时间 run_id）
   ├─ --verify / --cleanup → 提前返回
   │
   └─ _run_infrastructure(config, conn, dc)    ← daily/backfill 前执行
-       ├─ 1. subprocess: classify_apis.py
-       ├─ 2. subprocess: generate_schema.py
-       ├─ 2.5. 清缓存 + dc.load_rules() + importlib.reload(etl)
+       ├─ 1. 启用已校验快照 + dc.load_rules()
+       ├─ 2. init_schema(conn, snapshot.schema_sql)
        ├─ 3. trade_cal 补拉
        └─ 4. stock_basic / index_basic 刷新
   │
@@ -305,7 +310,10 @@ main()
   └─ 全量建库   → _run_backfill(since, until) → 质检
 ```
 
-subprocess 容错：classify/generate 失败时记录 error 日志，降级沿用既有产物，不阻断后续拉取。
+配置失败处理：分类、生成或候选校验失败时，在打开生产数据库前记录失败并终止；
+不混用旧产物继续拉取。无变化不重写文件。每个文件原子发布，普通发布异常恢复已发布文件；
+不宣称多个文件组成文件系统事务，进程被强杀后下次 daily/backfill 会重新构造并校验产物。
+显式 classify/generate CLI 继续保留；不要与维护进程并行编辑或生成配置。
 
 ### 拉取策略（由 `_get_date_params` 判定）
 
@@ -331,6 +339,10 @@ daily 按上次尝试时间从旧到新处理到期域和未完成域，每表�
 DB-001～005 的代码已离线验收，本次生产明细迁移、历史恢复、到期公告轮转、
 国家队/养老金派生重建及样本核对已完成。上游新空返回的旧增减持快照已归档，
 当前快照与历史归档的消费边界、未覆盖范围和证据见审查台账。
+
+domain 任务使用一次表级完成状态读取替代逐域×周期 COUNT，保持最新周期 ok=2 重验语义。
+调度与质检共用 `database/maintenance_report.py:domain_values` 获取驱动域；
+只有调度允许空驱动补拉。刷新标记统一在 `_pull_once` 处理，保留普通续跑缓存语义。
 
 domain 周期边界：backfill 用 `--since`，daily 传配置 `backfill_since`（不再传 `None` 全历史扫描）。
 驱动表为空时（全新库首轮，驱动表在 REGISTRY 中可能排在本表之后）按驱动表自身策略补拉
@@ -358,7 +370,10 @@ domain 周期边界：backfill 用 `--since`，daily 传配置 `backfill_since`�
 | `--verify` | - | 只读 `PRAGMA database_size` + 覆盖率报告（不写库） |
 | 建库 / --daily 末尾 | ❌ | 仅覆盖率报告 |
 
-覆盖分析：交易日历基准对齐 `backfill_since`。domain 表按 `date_mode` 聚合。大缺口 >100 天标注为可能 Tushare 断供。
+覆盖分析：交易日历基准对齐 `backfill_since`。domain-once 单独报告当前域的完成、
+到期、待处理、失败、放弃及可确认成功时间，不用公告日期密度判定完整。其余日期覆盖
+保持现有统计口径，不证明全市场/字段完整；大缺口 >100 天仍为提示，不能单独触发修复。
+`last_try` 在失败后无法提供上次成功时间，报告标明未知，不迁移 pull_log。
 
 ---
 
@@ -440,11 +455,16 @@ CREATE TABLE pull_log (
 | event | 来源 | 内容 |
 |-------|------|------|
 | `run_start` | main() | run_id, command, since/until |
-| `run_end` | main() | elapsed_sec, total_pulls |
-| `infra` | _run_infrastructure | classify/generate/stock_basic 步骤状态 |
+| `run_end` | main() | elapsed_sec, run_stats（本轮 HTTP 尝试/页/缓存命中/任务结果）, pull_log_total（历史状态总量） |
+| `infra` | _run_infrastructure | runtime_config/stock_basic 步骤状态及配置摘要 |
 | `pull` | DataClient + 策略函数 | api, rows, elapsed_ms, cache_hit；ok 仅策略函数/pull_log 侧事件携带 |
 | `error` | DataClient | error_type, error_code, error_msg |
-| `summary` | _verify | tables, total_rows, perfect/gap/empty |
+| `summary` | _verify | tables, total_rows, 日期覆盖、freshness、ok_3 |
+
+运行内日志自动带 run_id；任务请求、分页和落库通过 task_id 关联，
+请求记录含脱敏 task_params/request_params（含分页参数）。tasks_* 统计维护落库任务尝试，
+不等于唯一分区数；基础设施请求计入 HTTP/页数，未新增其 pull_log 记录。
+旧 total_pulls 字段改名为 pull_log_total，外部日志消费者需要同步字段名。
 
 查询示例：
 ```bash
@@ -470,6 +490,7 @@ tests/test_config_review.py   — 配置与辅助脚本审查回归（模板键�
 tests/test_duckdb_review.py   — DuckDB 引擎回归（Row/Result/锁/事务/可空主键/TryCast/元数据）
 tests/test_audit_contracts.py — 固定编号审查证据及独立计算对照（含严格 xfail，见台账）
 tests/test_contract_fixes.py — DB-001～005 修复验收与旧库迁移/备份恢复回归
+tests/test_core_maintenance.py — DB-006、缓存契约、批量状态查询、配置快照、日志与新鲜度验收
 ```
 
 测试不需要真实数据库或 Tushare 连接（`pytest tests/` 已配置 pythonpath，裸跑可用）。

@@ -69,21 +69,14 @@ def classify(api: dict, points: int, default_rate_limit: int) -> dict:
                    f"min_points={min_points}>{points}，积分不足，频率受限")
 
 
-def main():
-    if not INDEX_FILE.exists():
-        print(f"错误: {INDEX_FILE} 不存在")
-        sys.exit(1)
-
-    config = load_config()
+def classify_catalog(index: list[dict], config: dict) -> list[dict]:
+    """纯分类；独立候选不修改调用方的源元数据。"""
+    from copy import deepcopy
+    index = deepcopy(index)
     points = config.get("tushare_points", 2100)
     rate_limit = config.get("tushare_rate_limit", 200)
-    print(f"当前积分: {points}，最高频率: {rate_limit}/min")
-
-    index = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
     classified = [classify(api, points, rate_limit) for api in index]
     exclude = set(config.get("exclude_apis", []))
-
-    counts = Counter(api["_rule"] for api in classified)
 
     for api in classified:
         proj = api.setdefault("_project", {})
@@ -110,14 +103,29 @@ def main():
             clf["note"] = api["_note"]
         proj["classification"] = clf
 
-    written = [a.get("_project", {}).get("classification", {}).get("rule")
-               for a in classified]
-
     # 清理 classify() 产出的临时 _ 前缀字段（保留 _project）
     for api in classified:
         for key in list(api.keys()):
             if key.startswith("_") and key != "_project":
                 del api[key]
+
+    return classified
+
+
+def main():
+    if not INDEX_FILE.exists():
+        print(f"错误: {INDEX_FILE} 不存在")
+        sys.exit(1)
+
+    config = load_config()
+    points = config.get("tushare_points", 2100)
+    rate_limit = config.get("tushare_rate_limit", 200)
+    print(f"当前积分: {points}，最高频率: {rate_limit}/min")
+
+    index = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+    counts = Counter(classify(api, points, rate_limit)["_rule"] for api in index)
+    classified = classify_catalog(index, config)
+    written = [a.get("_project", {}).get("classification", {}).get("rule") for a in classified]
 
     # 原子写: tmp + os.replace，防 SIGKILL 截断
     data = json.dumps(classified, ensure_ascii=False, indent=2)

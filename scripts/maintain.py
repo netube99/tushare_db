@@ -14,12 +14,13 @@ import logging
 import os
 import sys
 import time
+from contextlib import ExitStack
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timedelta
 from database import get_conn, load_config, DataClient
 from database.etl import REGISTRY, log_pull
-import database.etl as _etl_module
+from scripts._runtime import prepare_runtime
 from database.utils import (init_schema, upsert_df, beijing_now, beijing_today,
                             setup_console_utf8)
 from database.client import TushareError, DailyLimitError
@@ -57,15 +58,18 @@ def _write_run_end(conn, run_id: str, t_start: float) -> None:
         "run_id": run_id,
         "elapsed_sec": round(time.time() - t_start, 1),
     }
+    from database.run_context import run_counts
+    entry["run_stats"] = run_counts()
     if conn is not None:
         stats = conn.execute(
             "SELECT ok, COUNT(*) FROM pull_log GROUP BY ok").fetchall()
         ok_counts = {r[0]: r[1] for r in stats}
         entry.update({
-            "total_pulls": sum(ok_counts.values()),
+            "pull_log_total": sum(ok_counts.values()),
             "ok_1": ok_counts.get(1, 0),
             "ok_2": ok_counts.get(2, 0),
             "ok_0": ok_counts.get(0, 0),
+            "ok_3": ok_counts.get(3, 0),
         })
     jlog.write(entry)
 
@@ -191,30 +195,35 @@ def _pull_and_store(conn, table: str, df, date_val: str,
 
 
 def _pull_once(conn, dc, entry, date_val: str, strategy: str, pfx: str,
-               label: str | None = None, **kwargs) -> bool | None:
-    """单次调用 + 错误归类 + 落库.
-
-    Returns: True=已处理, False=错误已记 ok=0, None=天级限流（调用方决定 break/return）.
-    """
-    api_name = entry["api"]
-    table = entry["table"]
-    name = label or api_name
-    try:
-        df = getattr(dc, api_name)(**kwargs)
-    except DailyLimitError as e:
-        logger.error(f"{pfx}{name} 天级限流: {e}")
-        return None
-    except TushareError as e:
-        logger.error(f"{pfx}{name} Tushare错误: {e}")
-        log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
-        return False
-    except Exception as e:
-        logger.error(f"{pfx}{name} 调用异常: {e}")
-        log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
-        return False
-    pkey = entry.get("partition_key")
-    partition = (pkey, [kwargs[pkey]]) if pkey and pkey in kwargs else None
-    return _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx, partition)
+               label: str | None = None, *, force_refresh: bool = False, **kwargs) -> bool | None:
+    """请求并落库：True=已处理，False=失败，None=天级限流。"""
+    from database.run_context import log_context, safe_params, task_id
+    if force_refresh:
+        kwargs["force_refresh"] = True
+    with log_context(task_id=task_id(entry["table"], date_val),
+                     task_params=safe_params(kwargs), table=entry["table"], date_val=date_val):
+        api_name = entry["api"]
+        table = entry["table"]
+        name = label or api_name
+        try:
+            df = getattr(dc, api_name)(**kwargs)
+        except DailyLimitError as e:
+            from database.run_context import count
+            from database.logger import get_json_logger
+            count("tasks_cooled_down")
+            get_json_logger().write({"level": "WARNING", "module": "maintain",
+                                     "event": "task_deferred", "api": api_name,
+                                     "reason": "daily_cooldown"})
+            logger.error(f"{pfx}{name} 天级限流: {e}")
+            return None
+        except Exception as e:
+            error_kind = "Tushare错误" if isinstance(e, TushareError) else "调用异常"
+            logger.error(f"{pfx}{name} {error_kind}: {e}")
+            log_pull(conn, table, date_val, 0, api=api_name, strategy=strategy)
+            return False
+        pkey = entry.get("partition_key")
+        partition = (pkey, [kwargs[pkey]]) if pkey and pkey in kwargs else None
+        return _pull_and_store(conn, table, df, date_val, api_name, strategy, pfx, partition)
 
 
 def _done_count(conn, table: str, date_val: str,
@@ -241,23 +250,23 @@ def _cal_query(conn, select="cal_date", since=None, until=None,
 
 
 def _dispatch_strategy(conn, dc, entry, strategy=None, since=None, until=None,
-                       *, progress=None, filter_date_val=None, refresh_done=False):
+                       *, progress=None, filter_date_val=None, refresh_done=False, force_refresh=False):
     """统一策略分派器。since/until 为 None 时由各策略函数自行决定."""
     if strategy is None:
         strategy = _get_date_params(entry)
     if strategy["strategy"] == "freq":
-        entry["freq_values"] = strategy.get("freq_values", DEFAULT_FREQ_VALUES)
-        _run_freq_strategy(conn, dc, entry, since, until, progress=progress)
+        entry = {**entry, "freq_values": strategy.get("freq_values", DEFAULT_FREQ_VALUES)}
+        _run_freq_strategy(conn, dc, entry, since, until, progress=progress, force_refresh=force_refresh)
     elif strategy["strategy"] == "trade_date":
         _run_trade_date_strategy(conn, dc, entry, since, until, progress=progress,
-                                 iter_mode=strategy.get("iter_mode", "trading"))
+                                 iter_mode=strategy.get("iter_mode", "trading"), force_refresh=force_refresh)
     elif strategy["strategy"] == "date_range":
-        _run_date_range_strategy(conn, dc, entry, since, until, progress=progress)
+        _run_date_range_strategy(conn, dc, entry, since, until, progress=progress, force_refresh=force_refresh)
     elif strategy["strategy"] == "domain":
         _run_domain_strategy(conn, dc, entry, since, until, progress=progress,
-                            filter_date_val=filter_date_val, refresh_done=refresh_done)
+                            filter_date_val=filter_date_val, refresh_done=refresh_done, force_refresh=force_refresh)
     else:
-        _run_once_strategy(conn, dc, entry, progress=progress)
+        _run_once_strategy(conn, dc, entry, progress=progress, force_refresh=force_refresh)
 
 
 def _auto_fix_bounds(strategy: dict, date_val: str) -> tuple[str | None, str | None, str | None]:
@@ -282,7 +291,7 @@ def _auto_fix_bounds(strategy: dict, date_val: str) -> tuple[str | None, str | N
 
 def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: str | None = None,
                             progress: tuple[int, int] | None = None,
-                            iter_mode: str = "trading"):
+                            iter_mode: str = "trading", *, force_refresh: bool = False):
     """逐交易日/自然日迭代拉取（最新→最早）.
 
     iter_mode: "trading" → 交易日历迭代, "calendar" → 自然日迭代（ann_date 用）.
@@ -323,7 +332,8 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
             filled += 1
             continue
         logger.info(f"{_pfx}{api_name}({date_col}={td}) → {table} [{i+1}/{total}]")
-        res = _pull_once(conn, dc, entry, td, "trade_date", _pfx, **{date_col: td})
+        res = _pull_once(conn, dc, entry, td, "trade_date", _pfx,
+                         force_refresh=force_refresh, **{date_col: td})
         if res is None:
             break
         filled += 1
@@ -332,7 +342,7 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
 
 
 def _run_date_range_strategy(conn, dc, entry, since: str | None = None, until: str | None = None,
-                            progress: tuple[int, int] | None = None):
+                            progress: tuple[int, int] | None = None, *, force_refresh: bool = False):
     """按年批次拉取（最新→最早）."""
     api_name = entry["api"]
     table = entry["table"]
@@ -352,12 +362,14 @@ def _run_date_range_strategy(conn, dc, entry, since: str | None = None, until: s
             f"{_pfx}{api_name}(start_date={year}0101, end_date={year}1231) → {table}")
         res = _pull_once(conn, dc, entry, year, "date_range", _pfx,
                          label=f"{api_name} {year}",
-                         start_date=f"{year}0101", end_date=f"{year}1231")
+                         start_date=f"{year}0101", end_date=f"{year}1231",
+                         force_refresh=force_refresh)
         if res is None:
             break
 
 
-def _run_once_strategy(conn, dc, entry, progress: tuple[int, int] | None = None):
+def _run_once_strategy(conn, dc, entry, progress: tuple[int, int] | None = None,
+                       *, force_refresh: bool = False):
     """一次性拉全量."""
     api_name = entry["api"]
     table = entry["table"]
@@ -367,12 +379,14 @@ def _run_once_strategy(conn, dc, entry, progress: tuple[int, int] | None = None)
         logger.info(f"{_pfx}{api_name}: 已完成（一次性），跳过")
         return
     logger.info(f"{_pfx}{api_name} → {table}")
-    _pull_once(conn, dc, entry, "__once__", "once", _pfx,
-               **entry.get("default_params", {}))
+    params = dict(entry.get("default_params", {}))
+    if force_refresh:
+        params["force_refresh"] = True
+    _pull_once(conn, dc, entry, "__once__", "once", _pfx, **params)
 
 
 def _run_freq_strategy(conn, dc, entry, since=None, until=None,
-                      progress: tuple[int, int] | None = None):
+                      progress: tuple[int, int] | None = None, *, force_refresh: bool = False):
     """逐交易日 × freq 值迭代拉取."""
     api_name = entry["api"]
     table = entry["table"]
@@ -392,7 +406,8 @@ def _run_freq_strategy(conn, dc, entry, since=None, until=None,
                 continue
             logger.info(f"{_pfx}{api_name}(trade_date={td}, freq={fv}) → {table} [{seq}/{total}]")
             res = _pull_once(conn, dc, entry, date_key, "freq", _pfx,
-                             trade_date=td, freq=fv)
+                             trade_date=td, freq=fv,
+                             force_refresh=force_refresh)
             if res is None:
                 return
             filled += 1
@@ -505,6 +520,8 @@ def _domain_refresh_queue(conn, entry: dict, domain_vals: list) -> tuple[list, s
             if record["ok"] == 0 and record["retry_count"] >= 5:
                 conn.execute("UPDATE pull_log SET ok=3 WHERE table_name=? AND date_val=?",
                              (entry["table"], key))
+                from database.run_context import count
+                count("tasks_abandoned")
                 continue
             try:
                 parsed = datetime.fromisoformat(record["last_try"])
@@ -527,7 +544,8 @@ def _domain_refresh_queue(conn, entry: dict, domain_vals: list) -> tuple[list, s
 
 def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                          progress: tuple[int, int] | None = None,
-                         filter_date_val: str | None = None, refresh_done: bool = False):
+                         filter_date_val: str | None = None, refresh_done: bool = False,
+                         force_refresh: bool = False):
     """domain 策略：逐域值 × 逐日期周期拉取.
 
     Args:
@@ -545,25 +563,14 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
     if until is None:
         until = _resolve_until()
 
-    # 1. 获取域列表（优先静态 values，否则从驱动表查询）
+    # 调度和质检共用域查询；只有调度允许驱动为空时补拉。
+    from database.maintenance_report import domain_values
     if "values" in driver:
-        domain_vals = driver["values"]
+        domain_vals = domain_values(conn, driver)
     else:
         source_table = driver["source_table"]
-        source_column = driver["source_column"]
-        filters = driver.get("filters", {})
-        query = f'SELECT DISTINCT "{source_column}" FROM "{source_table}"'
-        filter_params = []
-        if filters:
-            clauses = []
-            for col, values in filters.items():
-                placeholders = ",".join(["?"] * len(values))
-                clauses.append(f'"{col}" IN ({placeholders})')
-                filter_params.extend(values)
-            query += " WHERE " + " AND ".join(clauses)
-        query += f' ORDER BY "{source_column}"'
         try:
-            domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
+            domain_vals = domain_values(conn, driver)
         except Exception:
             logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不可用")
             domain_vals = []
@@ -577,7 +584,7 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 drv_since = since or _default_backfill_since()
                 _dispatch_strategy(conn, dc, drv_entry, None, drv_since, until,
                                    progress=progress)
-                domain_vals = [r[0] for r in conn.execute(query, filter_params).fetchall()]
+                domain_vals = domain_values(conn, driver)
             else:
                 logger.warning(f"{_pfx}{api_name}: 驱动表 {source_table} 不在 REGISTRY，无法拉取")
             if not domain_vals:
@@ -605,6 +612,10 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
     skipped = 0
     # 最新周期（当前月/年）不因 ok=2 跳过，允许每日重试等数据就绪
     latest_period_key = periods[0][0]
+    completed = {r[0]: r[1] for r in conn.execute(
+        "SELECT date_val,ok FROM pull_log WHERE table_name=? AND ok IN (1,2)",
+        (table,),
+    ).fetchall()}
 
     for dv in domain_vals:
         for period in periods:
@@ -621,10 +632,10 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
 
             # 跳过已完成；once 模式 ok=2 也跳过，最新周期仅 ok=1 跳过（ok=2 每日重试）
             if date_mode == "once" or period_key != latest_period_key:
-                ok_filter = "ok IN (1,2)"
+                done_statuses = (1, 2)
             else:
-                ok_filter = "ok=1"
-            if date_val not in refresh_keys and _done_count(conn, table, date_val, ok_filter):
+                done_statuses = (1,)
+            if date_val not in refresh_keys and completed.get(date_val) in done_statuses:
                 skipped += 1
                 continue
 
@@ -634,7 +645,7 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                 kwargs["end_date"] = period[2]
             elif date_mode == "daily":
                 kwargs["trade_date"] = period[0]
-            if date_val in refresh_keys:
+            if force_refresh or date_val in refresh_keys:
                 kwargs["force_refresh"] = True
             # once: 不传日期参数
 
@@ -646,10 +657,7 @@ def _run_domain_strategy(conn, dc, entry, since=None, until=None,
                             f"共 {len(domain_vals)} 域 × {len(periods)} 周期（限流中断）")
                 return
             if refresh_done and date_mode == "once" and "refresh_days" in driver:
-                if res:
-                    conn.execute("UPDATE pull_log SET retry_count=0 WHERE table_name=? AND date_val=?",
-                                 (table, date_val))
-                elif date_val in retry_keys:
+                if not res and date_val in retry_keys:
                     conn.execute("UPDATE pull_log SET retry_count=retry_count+1 "
                                  "WHERE table_name=? AND date_val=?", (table, date_val))
                 else:
@@ -691,70 +699,35 @@ def _run_backfill(conn, dc, target_api: str | None = None, since: str | None = N
         logger.info(f"[maintain] [{p[0]}/{p[1]}] {entry['api']}: 完成")
 
 
-_INFRA_FALLBACK = {
-    "classify_apis": "沿用既有 api_index.json 分类",
-    "generate_schema": "沿用既有 schema.sql/etl.py",
-}
+def _run_infrastructure(config, conn, dc, snapshot=None):
+    """发布通过校验的配置后初始化表结构并刷新基础设施。"""
+    from database.logger import get_json_logger
+    from database.utils import runtime_inputs, invalidate_registry_cache
+    from database.run_context import log_context
+    snapshot = snapshot or prepare_runtime(config)
+    global REGISTRY
+    REGISTRY = snapshot.registry
+    invalidate_registry_cache()
+    with runtime_inputs(config, snapshot.api_list), log_context(config_id=snapshot.fingerprint):
+        dc.load_rules()
+        init_schema(conn, snapshot.schema_sql)
+        get_json_logger().write({
+            "level": "INFO", "module": "infra", "event": "infra",
+            "step": "runtime_config", "status": "ok", "changed_files": snapshot.changed_files,
+        })
+        _refresh_infrastructure(conn, dc)
 
 
-def _run_infra_script(step_name: str, script_name: str, jlog) -> bool:
-    """运行 infra 子脚本（重分类/重生成）；失败时记录日志并沿用既有产物."""
-    import subprocess
-    fallback = _INFRA_FALLBACK.get(step_name, "沿用既有产物")
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
-    script_root = os.path.dirname(os.path.dirname(script_path))
-    logger.info(f"[infra] {step_name}…")
-    try:
-        subprocess.run([sys.executable, script_path],
-                       check=True, timeout=300, cwd=script_root)
-        jlog.write({"level": "INFO", "module": "infra", "event": "infra",
-                    "step": step_name, "status": "ok"})
-        return True
-    except subprocess.TimeoutExpired:
-        logger.error(f"[infra] {step_name} 超时 (timeout=300s)，{fallback}")
-        jlog.write({"level": "ERROR", "module": "infra", "event": "infra",
-                    "step": step_name, "status": "fail", "reason": "timeout"})
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[infra] {step_name} 失败 (rc={e.returncode})，{fallback}")
-        jlog.write({"level": "ERROR", "module": "infra", "event": "infra",
-                    "step": step_name, "status": "fail", "rc": e.returncode})
-    except OSError as e:
-        logger.error(f"[infra] {step_name} 系统错误: {e}，{fallback}")
-        jlog.write({"level": "ERROR", "module": "infra", "event": "infra",
-                    "step": step_name, "status": "fail", "reason": str(e)[:200]})
-    return False
-
-
-def _run_infrastructure(config, conn, dc):
-    """所有拉取模式前自动执行."""
+def _refresh_infrastructure(conn, dc):
     from database.logger import get_json_logger
     jlog = get_json_logger()
-
-    # 1. 重分类
-    _run_infra_script("classify_apis", "classify_apis.py", jlog)
-
-    # 2. 重生成
-    _run_infra_script("generate_schema", "generate_schema.py", jlog)
-
-    # 2.5 重载 DC 规则（api_index.json 已被 subprocess 更新，先清缓存）
-    from database.utils import load_api_registry, invalidate_registry_cache
-    invalidate_registry_cache()
-    dc.load_rules()
-
-    # 重载 etl 模块（generate_schema 已重写 etl.py），重新绑定 REGISTRY
-    import importlib
-    importlib.reload(_etl_module)
-    global REGISTRY
-    REGISTRY = _etl_module.REGISTRY
-
-    # schema.sql 已被重生成，当轮重新初始化表结构（幂等，新表立即可用）
-    init_schema(conn)
-
     # 3. 日历补拉
     def pull_cal(**kw) -> None:
-        df = dc.trade_cal(**kw)
-        if not df.empty:
-            upsert_df(conn, "trade_cal", df)
+        from database.run_context import log_context, safe_params, task_id
+        with log_context(task_id=task_id("trade_cal", "__infra__"), task_params=safe_params(kw)):
+            df = dc.trade_cal(**kw)
+            if not df.empty:
+                upsert_df(conn, "trade_cal", df)
 
     cal_count = conn.execute("SELECT COUNT(*) FROM trade_cal").fetchone()[0]
     if cal_count == 0:
@@ -787,7 +760,10 @@ def _run_infrastructure(config, conn, dc):
         api_func = getattr(dc, api_name)
         kwargs = entry.get("default_params", {})
         try:
-            df = api_func(**kwargs)
+            from database.run_context import log_context, safe_params, task_id
+            with log_context(task_id=task_id(entry["table"], "__infra__"),
+                             task_params=safe_params(kwargs)):
+                df = api_func(**kwargs, force_refresh=True)
         except TushareError as e:
             logger.error(f"[infra] {api_name} Tushare错误: {e}")
             continue
@@ -848,6 +824,7 @@ def _verify(conn, integrity_check=False) -> dict:
     trading_days = {r[0] for r in _cal_query(conn, since=cal_since, until=today_str)}
 
     stats = dict.fromkeys(("perfect", "small_gap", "big_gap", "empty", "untouched"), 0)
+    freshness = {}
     total_rows = 0
     anomalies: list[tuple] = []
 
@@ -873,6 +850,15 @@ def _verify(conn, integrity_check=False) -> dict:
         table = entry["table"]
         cnt = _count_table(conn, table)
         total_rows += cnt
+        driver = entry.get("driver")
+        if driver and driver["date_mode"] == "once":
+            from database.maintenance_report import snapshot_freshness
+            try:
+                freshness[table] = snapshot_freshness(conn, table, driver, beijing_now())
+            except Exception as exc:
+                freshness[table] = {"error": str(exc)}
+                anomalies.append((table, "刷新状态未知", str(exc)))
+            continue
         if cnt == 0:
             mark_empty(table)
             continue
@@ -958,6 +944,7 @@ def _verify(conn, integrity_check=False) -> dict:
         "untouched": stats["untouched"],
         "anomalies": anomalies,
         "pl_ok": pl_ok, "pl_empty": pl_empty, "pl_fail": pl_fail,
+        "pl_abandoned": pl_counts.get(3, 0), "freshness": freshness,
         "design_issues": design_issues,
     }
 
@@ -972,6 +959,7 @@ def _verify(conn, integrity_check=False) -> dict:
         "untouched": result["untouched"],
         "ok_1": result["pl_ok"], "ok_2": result["pl_empty"],
         "ok_0": result["pl_fail"],
+        "ok_3": result["pl_abandoned"], "freshness": freshness,
         "design_issues": len(result["design_issues"]),
     })
 
@@ -983,7 +971,7 @@ def _print_report(r: dict):
     print(f"  质检报告  {beijing_today()}")
     print(f"{'='*40}")
     print(f"\nREGISTRY: {r['tables']} 张表, {r['size_gb']:.1f}GB, {r['total_rows']:,} 行\n")
-    print(f"┌─ 完整 (≥99.9%): {r['perfect']} 张")
+    print(f"┌─ 日期覆盖 ≥99.9%（不代表数据完整）: {r['perfect']} 张")
     print(f"├─ 小缺口 (≥95%): {r['small_gap']} 张")
     print(f"├─ 大缺口: {r['big_gap']} 张")
     print(f"├─ 空表: {r['empty']} 张")
@@ -995,6 +983,16 @@ def _print_report(r: dict):
             print(f"  {t:30s} {reason:10s} {detail}")
 
     print(f"\npull_log: ok=1:{r['pl_ok']} / ok=2:{r['pl_empty']} / ok=0:{r['pl_fail']}")
+    print(f"放弃任务 ok=3: {r['pl_abandoned']}")
+    for table, state in r["freshness"].items():
+        if "error" in state:
+            print(f"  {table}: 刷新状态未知 ({state['error']})")
+        else:
+            print(f"  {table}: {state['domains']}域 / 完成{state['completed']} / "
+                  f"到期{state['due']} / 待处理{state['pending']} / "
+                  f"失败{state['failed']} / 放弃{state['abandoned']} / "
+                  f"成功时间未知{state['unknown_success_time']} / "
+                  f"最早可确认成功{state['oldest_success'] or '未知'}")
 
     if r["design_issues"]:
         print(f"\n设计外事件: {len(r['design_issues'])} 个")
@@ -1082,7 +1080,7 @@ def _recheck_ok2_empty(conn, dc, where_sql: str, params: tuple, label: str) -> N
                 continue
             s, u = min(dates), max(dates)
             logger.info(f"[daily] {table}: 复验 {len(dates)} 个{label}空日 [{s}..{u}]")
-            _dispatch_strategy(conn, dc, entry, strategy, s, u)
+            _dispatch_strategy(conn, dc, entry, strategy, s, u, force_refresh=True)
     finally:
         conn.executemany(
             "INSERT OR IGNORE INTO pull_log "
@@ -1143,7 +1141,8 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
                 (table, current_year),
             )
             conn.commit()
-        _dispatch_strategy(conn, dc, entry, strategy, ds, target_str, progress=p)
+        _dispatch_strategy(conn, dc, entry, strategy, ds, target_str, progress=p,
+                           force_refresh=(strategy["strategy"] == "date_range"))
         logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
 
     for entry in once_entries:
@@ -1155,7 +1154,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             (entry["table"],),
         )
         conn.commit()
-        _run_once_strategy(conn, dc, entry, progress=p)
+        _run_once_strategy(conn, dc, entry, progress=p, force_refresh=True)
         logger.info(f"[daily] [{p[0]}/{p[1]}] {entry['table']}: 完成")
 
     _verify(conn)
@@ -1195,6 +1194,8 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
                     (table, date_val),
                 )
                 conn.commit()
+                from database.run_context import count
+                count("tasks_abandoned")
                 continue
             if dc._daily_cooldown_until.get(entry["api"], 0) > time.time():
                 logger.info(f"[daily] {entry['api']} 冷却中，跳过修复")
@@ -1207,7 +1208,7 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
             conn.commit()
             strategy = _get_date_params(entry)
             s, u, fdv = _auto_fix_bounds(strategy, date_val)
-            _dispatch_strategy(conn, dc, entry, strategy, s, u, filter_date_val=fdv)
+            _dispatch_strategy(conn, dc, entry, strategy, s, u, filter_date_val=fdv, force_refresh=True)
         _verify(conn)
     _write_run_end(conn, run_id, t_start)
 
@@ -1236,7 +1237,7 @@ def _cmd_refresh(conn, dc, args, run_id, t_start):
     conn.commit()
     logger.info(f"[refresh] {api} {date_val}: pull_log 已清 (keys={log_keys})")
     s, u, fdv = _auto_fix_bounds(strategy, date_val)
-    _dispatch_strategy(conn, dc, entry, strategy, s, u, filter_date_val=fdv)
+    _dispatch_strategy(conn, dc, entry, strategy, s, u, filter_date_val=fdv, force_refresh=True)
     logger.info(f"[refresh] {api} {date_val}: 完成")
     _write_run_end(conn, run_id, t_start)
 
@@ -1303,43 +1304,58 @@ def main():
     from database.logger import get_json_logger
     from database import engine as _engine
     jlog = get_json_logger()
-    run_id = beijing_now().strftime("%Y%m%dT%H%M%S")
+    run_id = beijing_now().strftime("%Y%m%dT%H%M%S%f")
     t_start = time.time()
 
     command = ("verify" if args.verify else "cleanup" if args.cleanup
                else "dry_run" if args.dry_run else "refresh" if args.refresh
                else "daily" if args.daily else "backfill")
 
-    if command == "dry_run":
-        # 只打印策略矩阵：不连接数据库、不建 schema、不取锁
-        _log_run_start(jlog, run_id, command, args)
-        _cmd_dry_run(args, run_id, t_start)
-        return
-
-    with _engine.db_lock(_engine.DEFAULT_DB_PATH,
-                         exclusive=(command != "verify")) as acquired:
-        if not acquired:
-            logger.error("[maintain] 数据库被其他进程占用（DuckDB 单写者），放弃本次运行")
-            return
-        conn = get_conn(read_only=(command == "verify"))
-        try:
-            if command == "verify":
-                runner = lambda: _cmd_verify(conn, run_id, t_start)
-            elif command == "cleanup":
-                runner = lambda: _cmd_cleanup(conn, dc, args, run_id, t_start)
-            elif command == "refresh":
-                runner = lambda: _cmd_refresh(conn, dc, args, run_id, t_start)
-            elif command == "daily":
-                runner = lambda: _cmd_daily(conn, dc, args, config, run_id, t_start)
-            else:
-                runner = lambda: _cmd_backfill(conn, dc, args, run_id, t_start)
-
+    from database.utils import runtime_inputs
+    from database.run_context import run_context, log_context
+    with ExitStack() as stack:
+        stack.enter_context(run_context(run_id))
+        if command == "dry_run":
+            # 只打印策略矩阵：不连接数据库、不建 schema、不取锁
             _log_run_start(jlog, run_id, command, args)
+            _cmd_dry_run(args, run_id, t_start)
+            return
+
+        with _engine.db_lock(_engine.DEFAULT_DB_PATH,
+                             exclusive=(command != "verify")) as acquired:
+            if not acquired:
+                logger.error("[maintain] 数据库被其他进程占用（DuckDB 单写者），放弃本次运行")
+                return
+            snapshot = None
             if command in ("daily", "backfill"):
-                _run_infrastructure(config, conn, dc)
-            runner()
-        finally:
-            conn.close()
+                try:
+                    snapshot = prepare_runtime(config)
+                except Exception as exc:
+                    jlog.write({"level": "ERROR", "module": "infra", "event": "infra",
+                                "step": "runtime_config", "status": "fail",
+                                "error_type": type(exc).__name__, "error_msg": str(exc)})
+                    raise
+                stack.enter_context(runtime_inputs(config, snapshot.api_list))
+                stack.enter_context(log_context(config_id=snapshot.fingerprint))
+                global REGISTRY
+                REGISTRY = snapshot.registry
+            conn = get_conn(read_only=(command == "verify"), initialize=(snapshot is None))
+            try:
+                _log_run_start(jlog, run_id, command, args)
+                if command in ("daily", "backfill"):
+                    _run_infrastructure(config, conn, dc, snapshot)
+                if command == "verify":
+                    _cmd_verify(conn, run_id, t_start)
+                elif command == "cleanup":
+                    _cmd_cleanup(conn, dc, args, run_id, t_start)
+                elif command == "refresh":
+                    _cmd_refresh(conn, dc, args, run_id, t_start)
+                elif command == "daily":
+                    _cmd_daily(conn, dc, args, config, run_id, t_start)
+                else:
+                    _cmd_backfill(conn, dc, args, run_id, t_start)
+            finally:
+                conn.close()
 
 if __name__ == "__main__":
     main()

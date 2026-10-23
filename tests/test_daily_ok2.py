@@ -79,7 +79,7 @@ def test_daily_revalidates_stale_ok2(scratch):
     assert row[0] == 2
     last_dt = datetime.fromisoformat(row[1].replace(" ", "T")).replace(tzinfo=now.tzinfo)
     assert last_dt >= now - timedelta(minutes=1)
-    assert ("stk_factor_pro", {"trade_date": "20240101"}) in dc.calls
+    assert ("stk_factor_pro", {"trade_date": "20240101", "force_refresh": True}) in dc.calls
 
     # 近期 ok=2 复验：无法重拉（日历无该日）时回填原记录，last_try 保持不变
     fresh_row = conn.execute(

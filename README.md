@@ -63,6 +63,21 @@ python scripts/maintain.py --daily
 0 21 * * 1-5 cd /path/to/tushare_db && python scripts/maintain.py --daily >> logs/cron.log 2>&1
 ```
 
+### 核心维护契约
+
+建库/每日维护先在内存中完成分类、DDL/REGISTRY 生成和契约校验，再按需更新生成物。
+无变化不重写文件；配置失败会在打开生产库前终止，不再沿用混合产物继续拉取。
+
+续跑可以使用七天缓存；`--refresh`、每日快照/年度主动刷新、空返回复验及失败自动修复
+绕过缓存请求上游。公告表保留现有七天最小间隔和预算，不增加历史修订扫描窗口。
+
+`--verify` 对逐股公告快照报告域刷新状态；日期覆盖不代表全市场完整性。
+JSON 日志增加运行/任务关联与请求参数；`run_end.run_stats` 是本轮尝试统计，
+历史状态总数使用 `pull_log_total`（替代旧 `total_pulls` 字段）。
+配置发布由逐文件原子替换组成；普通异常恢复已发布文件，进程强杀后在下次建库/日更重新校验。
+
+详细范围、验收及未覆盖项见 [核心整改方案](docs/core-maintenance-plan.md)。
+
 ### Qlib 转换
 
 Qlib 当前存在已确认未修复的问题：历史修订同步、日历索引变更、转债 VWAP 单位和
@@ -146,11 +161,14 @@ tushare_db/
 │   ├── engine.py               # DuckDB 连接封装 / Row / 元数据 / 跨进程锁
 │   ├── client.py               # DataClient（HTTPS + 缓存 + 分页 + 限速）
 │   ├── utils.py                # 连接、upsert、配置、时间工具
+│   ├── maintenance_report.py   # 驱动域查询与公告刷新状态
+│   ├── run_context.py          # 运行/任务日志上下文与计数
 │   ├── etl.py                  # REGISTRY（自动生成）
 │   ├── schema.py               # DDL 加载
 │   └── schema.sql              # DDL（自动生成）
 ├── scripts/
 │   ├── maintain.py             # 建库 / 日更 / 清理 / 质检
+│   ├── _runtime.py             # 配置快照校验与生成物按需发布
 │   ├── classify_apis.py        # 接口分级
 │   ├── generate_schema.py      # Schema + REGISTRY 生成
 │   ├── repair_data_contracts.py # DuckDB 明细主键修复 / 缓存恢复 / 备份
@@ -158,6 +176,7 @@ tushare_db/
 │   ├── refresh_pension_daily.py # 养老金派生表
 │   └── convert_to_qlib.py      # Qlib 转换 CLI 入口
 ├── docs/code-quality-baseline.md # 固定问题台账与修复验收记录
+├── docs/core-maintenance-plan.md # 核心维护整改与精简验收
 ├── qlib_export/                # Qlib 转换引擎子模块
 │   ├── specs.py                # TABLE_SPECS + 字段映射
 │   ├── sync_log.py             # bin_sync_log 状态机
@@ -170,6 +189,7 @@ tushare_db/
 │   ├── test_pure.py            # 纯函数单测
 │   ├── test_state_machine.py   # 状态机单测
 │   ├── test_integration.py     # mock 集成测试
+│   ├── test_core_maintenance.py # 配置快照、刷新、域查询及日志契约
 │   └── test_regression.py      # 回归护栏
 └── data/                       # market.duckdb（不入 git）
 ```
@@ -182,5 +202,5 @@ tushare_db/
 uv run pytest tests/ -q    # 无需真实数据库或 Tushare 连接
 ```
 
-当前验收结果为 346 passed、0 failed、5 xfailed。五个严格 xfail 对应台账中
+当前验收结果为 366 passed、0 failed、5 xfailed。五个严格 xfail 对应台账中
 尚未修复的 Qlib 问题，不计为通过；SQLite 迁移功能已移除，当前运行栈仅使用 DuckDB。

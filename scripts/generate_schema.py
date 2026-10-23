@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json as _json
-import os
 import sys
 from pathlib import Path
 
@@ -293,10 +292,8 @@ def generate_registry(api_list: list[dict]) -> str:
     ]) + "\n"
 
 
-def inject_registry(etl_path: str, registry_code: str) -> None:
-    """将 REGISTRY 代码注入 etl.py，替换 REGISTRY = [...] 段（原子写）."""
-    with open(etl_path, encoding="utf-8") as f:
-        content = f.read()
+def render_registry(content: str, registry_code: str) -> str:
+    """先在内存校验完整模块，再由调用方发布。"""
 
     try:
         compile(registry_code, "<registry>", "exec")
@@ -324,13 +321,15 @@ def inject_registry(etl_path: str, registry_code: str) -> None:
 
     new_content = content[:comment_line] + registry_code + "\n" + content[end + 1:]
     try:
-        compile(new_content, etl_path, "exec")
+        compile(new_content, "<etl>", "exec")
     except SyntaxError as e:
         raise ValueError(f"注入后 etl.py 语法非法: {e}")
-    tmp_path = etl_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    os.replace(tmp_path, etl_path)
+    return new_content
+
+
+def inject_registry(etl_path: str, registry_code: str) -> None:
+    content = Path(etl_path).read_text(encoding="utf-8")
+    atomic_write_text(etl_path, render_registry(content, registry_code))
 
 
 def main():

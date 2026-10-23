@@ -8,6 +8,7 @@ _resolve_until 边界 / 策略判定顺序 / 续跑 ok 状态 / 质检断供标�
 import sys
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -81,6 +82,10 @@ def quiet_jlog(monkeypatch):
             writes.append(entry)
 
     monkeypatch.setattr(database.logger, "get_json_logger", lambda: Dummy())
+    # 基础设施用例只消费内存候选，不发布真实仓库产物。
+    monkeypatch.setattr(m, "prepare_runtime", lambda config: SimpleNamespace(
+        registry=REGISTRY, api_list=database.utils.load_api_registry(),
+        schema_sql=database.utils.load_schema_sql(), fingerprint="test", changed_files=[]))
     return writes
 
 
@@ -298,7 +303,7 @@ def test_daily_recent_ok2_rechecked_and_filled(daily_env, monkeypatch):
     m._cmd_daily(conn, dc, _Args(until="20260918"),
                  {"backfill_since": "20260901"}, "run", 0.0)
 
-    assert ("stk_factor_pro", {"trade_date": "20260918"}) in dc.calls
+    assert ("stk_factor_pro", {"trade_date": "20260918", "force_refresh": True}) in dc.calls
     ok = conn.execute(
         "SELECT ok FROM pull_log WHERE table_name='stk_factor_pro' "
         "AND date_val='20260918'").fetchone()[0]
@@ -324,7 +329,7 @@ def test_daily_recent_ok2_still_empty_refreshes_last_try(daily_env, monkeypatch)
     m._cmd_daily(conn, dc, _Args(until="20260918"),
                  {"backfill_since": "20260901"}, "run", 0.0)
 
-    assert ("stk_factor_pro", {"trade_date": "20260918"}) in dc.calls
+    assert ("stk_factor_pro", {"trade_date": "20260918", "force_refresh": True}) in dc.calls
     row = conn.execute(
         "SELECT ok, last_try FROM pull_log WHERE table_name='stk_factor_pro' "
         "AND date_val='20260918'").fetchone()
@@ -338,7 +343,6 @@ def test_daily_recent_ok2_still_empty_refreshes_last_try(daily_env, monkeypatch)
 def test_infra_fills_calendar_gap_when_behind(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20260101", "20260105"])
-    monkeypatch.setattr(m, "_run_infra_script", lambda *a, **k: True)
     monkeypatch.setattr(m, "beijing_today", lambda: date(2026, 9, 13))
     dc = FakeDC()
 
@@ -352,7 +356,6 @@ def test_infra_fills_calendar_gap_when_behind(monkeypatch):
 def test_infra_extends_calendar_when_near_end(monkeypatch):
     conn = make_conn()
     add_cal(conn, ["20260105", "20260919"])
-    monkeypatch.setattr(m, "_run_infra_script", lambda *a, **k: True)
     monkeypatch.setattr(m, "beijing_today", lambda: date(2026, 9, 13))
     dc = FakeDC()
 
@@ -412,7 +415,7 @@ def test_refresh_date_range_with_full_date(monkeypatch):
     m._cmd_refresh(conn, dc, _Args(refresh=["gz_index", "20250601"]), "run", 0.0)
 
     dr_calls = [kw for (api, kw) in dc.calls if api == "gz_index"]
-    assert dr_calls == [{"start_date": "20250101", "end_date": "20251231"}]
+    assert dr_calls == [{"start_date": "20250101", "end_date": "20251231", "force_refresh": True}]
 
 
 # ── D6: _disabled 参数标记 ──
@@ -735,24 +738,21 @@ def test_verify_default_skips_integrity_check(monkeypatch, capsys):
     assert "integrity_check" not in capsys.readouterr().out
 
 
-# ── 守护：infra 子脚本失败降级不阻断 ──
+# ── 配置候选失败应阻断；不再混用旧产物继续拉取 ──
 
 
-def test_infra_script_failure_degrades(monkeypatch, quiet_jlog):
-    import subprocess
+def test_infra_invalid_snapshot_aborts_before_schema_or_network(monkeypatch):
+    conn = make_conn()
+    dc = FakeDC()
 
-    def fail(*a, **k):
-        raise subprocess.CalledProcessError(1, "script")
+    def fail(*args):
+        raise ValueError("invalid candidate")
 
-    monkeypatch.setattr(subprocess, "run", fail)
-
-    class Dummy:
-        def write(self, entry):
-            quiet_jlog.append(entry)
-
-    assert m._run_infra_script("classify_apis", "classify_apis.py", Dummy()) is False
-    assert quiet_jlog[-1]["event"] == "infra"
-    assert quiet_jlog[-1]["status"] == "fail"
+    monkeypatch.setattr(m, "prepare_runtime", fail)
+    monkeypatch.setattr(m, "init_schema", lambda *a: pytest.fail("must not write schema"))
+    with pytest.raises(ValueError, match="invalid candidate"):
+        m._run_infrastructure({}, conn, dc)
+    assert dc.calls == []
 
 
 # ── 守护：_write_run_end 边界 ──
@@ -771,7 +771,6 @@ def test_write_run_end_without_conn_skips_pull_log_stats(quiet_jlog):
 
 def test_infra_reinits_schema_after_regeneration(monkeypatch):
     conn = make_conn()
-    monkeypatch.setattr(m, "_run_infra_script", lambda *a, **k: True)
     real_load = database.utils.load_schema_sql
     monkeypatch.setattr(
         database.utils, "load_schema_sql",

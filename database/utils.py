@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -25,6 +27,16 @@ _CST = ZoneInfo("Asia/Shanghai")
 
 # api_index.json 内存缓存
 _registry_cache: list[dict] | None = None
+_runtime_inputs: ContextVar[tuple | None] = ContextVar("runtime_inputs", default=None)
+
+
+@contextmanager
+def runtime_inputs(config: dict, api_list: list[dict]):
+    token = _runtime_inputs.set((config, api_list))
+    try:
+        yield
+    finally:
+        _runtime_inputs.reset(token)
 
 # 已告警过的 (表, 被丢弃列)：避免每次拉取重复刷日志
 _dropped_warned: set[tuple[str, tuple[str, ...]]] = set()
@@ -68,9 +80,9 @@ def beijing_today() -> date:
     return beijing_now().date()
 
 
-def init_schema(conn: Connection) -> None:
+def init_schema(conn: Connection, schema_sql: str | None = None) -> None:
     """初始化数据库表结构（幂等，CREATE IF NOT EXISTS，每次调用读取最新 schema.sql）."""
-    schema_sql = load_schema_sql()
+    schema_sql = load_schema_sql() if schema_sql is None else schema_sql
     if not schema_sql.strip():
         raise RuntimeError(
             "database/schema.sql 缺失或为空，请先运行 scripts/generate_schema.py 生成"
@@ -121,7 +133,8 @@ def _sync_columns(conn: Connection, schema_sql: str) -> None:
                 conn.execute(f"ALTER TABLE {qt} ALTER COLUMN {qc} SET NOT NULL")
 
 
-def get_conn(db_path: str | None = None, read_only: bool = False) -> Connection:
+def get_conn(db_path: str | None = None, read_only: bool = False,
+             *, initialize: bool = True) -> Connection:
     """获取 DuckDB 连接并初始化 schema.
 
     db_path: 数据库文件路径。None 则使用 data/market.duckdb，":memory:" 为内存库。
@@ -141,7 +154,7 @@ def get_conn(db_path: str | None = None, read_only: bool = False) -> Connection:
         memory_limit=config.get("duckdb_memory_limit"),
         checkpoint_threshold=config.get("duckdb_checkpoint_threshold"),
     )
-    if not read_only:
+    if not read_only and initialize:
         init_schema(conn)
     return conn
 
@@ -265,6 +278,9 @@ def _cast_expr(col: str, col_type: str) -> str:
 def load_api_registry() -> list[dict]:
     """加载 api_index.json——项目配置的唯一真相源."""
     global _registry_cache
+    snapshot = _runtime_inputs.get()
+    if snapshot is not None:
+        return snapshot[1]
     if _registry_cache is not None:
         return _registry_cache
     path = os.path.join(PROJECT_ROOT, "api_index.json")
@@ -285,6 +301,9 @@ def load_config(config_path: str | None = None) -> dict:
     Args:
         config_path: 配置文件路径。None 则使用项目根目录下的 user_config.yaml。
     """
+    snapshot = _runtime_inputs.get()
+    if config_path is None and snapshot is not None:
+        return snapshot[0]
     if config_path is None:
         config_path = os.path.join(PROJECT_ROOT, "user_config.yaml")
     try:

@@ -32,6 +32,9 @@ class JsonLogger:
         self._current_date = today
 
     def write(self, data: dict[str, Any]) -> None:
+        from database.run_context import context_fields, record_event
+        record_event(data)
+        data = {**context_fields(), **data}
         try:
             ts = beijing_now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
             entry = {"ts": ts, **data}
