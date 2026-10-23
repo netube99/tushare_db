@@ -148,6 +148,23 @@ for entry in REGISTRY:
 注意：DuckDB 为单写者模型，`maintain.py` 与 `convert_to_qlib.py` 不可并行运行；
 两者通过 `data/.market.lock` 文件锁自动串行。只读消费者请用 `get_conn(read_only=True)`。
 
+### 数据语义加工的两仓分界（2026-10-24 起）
+
+下游（ddup）接入层与本仓的职责分界：
+
+- **本仓**：tushare 原始镜像 + 有状态日频物化（前向携带/过期/退出事件，
+  如 `pension_float_daily`、`national_team_daily`，由 refresh 脚本重建）；
+  `dividend_grid`、`top_inst_agg` 这类无争议的轻聚合视图保留。
+- **下游接入层**（ddup `adapters/tushare.py`）：公告日→下一开市日对齐、
+  同日多条合并等无状态变换——即「公告何时进入 T 日决策」的量化语义，
+  由 ddup 的 `ddup_*_daily` 对齐 VIEW 承载。
+- 已退役（2026-10-24）：`stk_holdertrade_agg` / `stk_holdernumber_agg` /
+  `pledge_detail_agg`——语义（含 holdertrade 按 `in_de` 带符号，DE=负）
+  已收编进 ddup 对齐层，两仓不再双份维护同一口径。
+
+新接事件表决策原则：能用无状态 SQL VIEW 一次表达且下游 preload 只算一次
+不痛 → 下游对齐层；需要携带/过期等有状态物化 → 本仓 refresh 脚本。
+
 ---
 
 ## 目录

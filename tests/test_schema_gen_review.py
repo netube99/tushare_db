@@ -289,10 +289,11 @@ def test_schema_and_registry_dedup_by_api_name():
     assert len(_registry_entries(reg)) == 1
 
 
-# ── 派生视图 DDL（defect 3：stk_holdertrade_agg 带符号 + 契约持久化） ──
+# ── 派生视图 DDL（defect 3 带符号口径 2026-10-24 随视图退役迁入 ddup
+# ddup_holdertrade_daily 对齐层，等价测试见 ddup tests/test_tushare_align.py
+# 的 test_same_day_merge_semantics）──
 
-VIEW_NAMES = ("dividend_grid", "stk_holdernumber_agg",
-              "stk_holdertrade_agg", "pledge_detail_agg", "top_inst_agg")
+VIEW_NAMES = ("dividend_grid", "top_inst_agg")
 
 
 def test_generate_schema_embeds_derived_views():
@@ -300,7 +301,13 @@ def test_generate_schema_embeds_derived_views():
     for view in VIEW_NAMES:
         assert f"DROP VIEW IF EXISTS {view};" in sql
         assert f"CREATE VIEW {view} AS" in sql
-    assert "CASE WHEN in_de = 'DE' THEN -change_vol" in sql
+    # 2026-10-24 退役：仅余 DROP（旧库重放清理），不再有 CREATE；
+    # 带符号口径随视图收编进 ddup ddup_holdertrade_daily
+    for retired in ("stk_holdernumber_agg", "stk_holdertrade_agg",
+                    "pledge_detail_agg"):
+        assert f"CREATE VIEW {retired} AS" not in sql
+        assert f"DROP VIEW IF EXISTS {retired};" in sql
+    assert "CASE WHEN in_de = 'DE' THEN -change_vol" not in sql
 
 
 @pytest.fixture()
@@ -337,30 +344,6 @@ def test_top_inst_agg_institution_rows_only(view_conn):
         "WHERE ts_code='000001.SZ'").fetchone()
     assert net == 200.0
     assert rate == pytest.approx(0.75)  # 300 / (300+100)
-
-
-def test_stk_holdertrade_agg_signs_de_as_negative(view_conn):
-    view_conn.execute(
-        "INSERT INTO stk_holdertrade VALUES ('600267.SH','20230520','DE',100.0,47.10)")
-    view_conn.execute(
-        "INSERT INTO stk_holdertrade VALUES ('000001.SZ','20240101','IN',200.0,3.0)")
-    vol, ratio = view_conn.execute(
-        "SELECT change_vol, change_ratio FROM stk_holdertrade_agg "
-        "WHERE ts_code='600267.SH'").fetchone()
-    assert vol == -100.0
-    assert ratio == pytest.approx(-47.10)
-
-
-def test_stk_holdertrade_agg_mixed_direction_net(view_conn):
-    view_conn.execute(
-        "INSERT INTO stk_holdertrade VALUES ('000002.SZ','20240101','IN',100.0,2.0)")
-    view_conn.execute(
-        "INSERT INTO stk_holdertrade VALUES ('000002.SZ','20240101','DE',100.0,4.0)")
-    vol, ratio = view_conn.execute(
-        "SELECT change_vol, change_ratio FROM stk_holdertrade_agg "
-        "WHERE ts_code='000002.SZ'").fetchone()
-    assert vol == 0.0
-    assert ratio == pytest.approx(-1.0)   # (100*2 - 100*4) / 200
 
 
 # ── top_inst：逐席位多行（defect 5），no_pk + 交易日分区替换 ──

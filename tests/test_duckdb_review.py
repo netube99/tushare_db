@@ -288,5 +288,7 @@ def test_generated_schema_sql_runs_on_duckdb():
     engine.execute_script(conn, load_schema_sql())
     views = {r[0] for r in conn.execute(
         "SELECT view_name FROM duckdb_views() WHERE schema_name='main'")}
-    assert {"dividend_grid", "stk_holdernumber_agg", "stk_holdertrade_agg",
-            "pledge_detail_agg", "top_inst_agg"} <= views
+    assert {"dividend_grid", "top_inst_agg"} <= views
+    # 2026-10-24 退役：语义收编进 ddup ddup_*_daily 对齐层，重放时自动清理
+    assert not {"stk_holdernumber_agg", "stk_holdertrade_agg",
+                "pledge_detail_agg"} & views

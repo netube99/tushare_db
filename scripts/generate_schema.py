@@ -171,6 +171,13 @@ CREATE TABLE IF NOT EXISTS pull_log (
 # 视图从物理表聚合出 (ts_code, 日期) 唯一键，供 ddup adapters/tushare.py 读取。
 # 用 DROP VIEW IF EXISTS + CREATE VIEW（而非 IF NOT EXISTS）保证 init_schema
 # 每次执行都把 DB 中的旧定义替换为仓库当前定义。
+#
+# 2026-10-24 退役：stk_holdernumber_agg / stk_holdertrade_agg / pledge_detail_agg
+# 三视图的语义（同公告日聚合，含 holdertrade 按 in_de 带符号）已收编进
+# ddup adapters/tushare.py 的 ddup_*_daily 对齐 VIEW（公告日→下一开市日
+# + 同日合并，F-FAC-06）。两仓不再双份维护同一口径；保留 DROP 使重放
+# schema.sql 的旧库自动清理。分界原则：无状态对齐/聚合归 ddup 接入层；
+# 有状态日频物化（pension/national_team 的携带+过期）归本仓 refresh 脚本。
 DERIVED_VIEWS_DDL = """-- 现金分红事件（ex_date 作 trade_date，仅除息日有值）
 DROP VIEW IF EXISTS dividend_grid;
 CREATE VIEW dividend_grid AS
@@ -179,32 +186,10 @@ CREATE VIEW dividend_grid AS
   WHERE div_proc='实施' AND cash_div > 0 AND ex_date IS NOT NULL
   GROUP BY ts_code, ex_date;
 
--- 股东人数（同公告取 MAX 披露口径）
+-- 已退役 2026-10-24：语义收编进 ddup ddup_*_daily 对齐层（见 scripts/generate_schema.py 注释）
 DROP VIEW IF EXISTS stk_holdernumber_agg;
-CREATE VIEW stk_holdernumber_agg AS
-  SELECT ts_code, ann_date, MAX(holder_num) AS holder_num
-  FROM stk_holdernumber WHERE holder_num IS NOT NULL GROUP BY ts_code, ann_date;
-
--- 股东增减持（change_vol/change_ratio 按 in_de 带符号，DE=负；
--- change_ratio 为绝对变动股数加权的带符号平均比例，分母仍为绝对股数之和）
 DROP VIEW IF EXISTS stk_holdertrade_agg;
-CREATE VIEW stk_holdertrade_agg AS
-  SELECT ts_code, ann_date,
-         SUM(CASE WHEN in_de = 'DE' THEN -change_vol ELSE change_vol END) AS change_vol,
-         SUM(CASE WHEN in_de = 'DE' THEN -change_vol * change_ratio
-                  ELSE change_vol * change_ratio END)
-             / NULLIF(SUM(change_vol), 0) AS change_ratio
-  FROM stk_holdertrade
-  GROUP BY ts_code, ann_date;
-
--- 股权质押（同公告取 MAX 披露比例，保守口径）
 DROP VIEW IF EXISTS pledge_detail_agg;
-CREATE VIEW pledge_detail_agg AS
-  SELECT ts_code, ann_date,
-         MAX(p_total_ratio) AS p_total_ratio,
-         MAX(h_total_ratio) AS h_total_ratio
-  FROM pledge_detail
-  GROUP BY ts_code, ann_date;
 
 -- 龙虎榜机构席位聚合（top_inst 为逐席位多行，2026-09 起不再折叠：
 -- 原 PK(ts_code, trade_date) 会把多席位 INSERT OR REPLACE 成任意单行）。

@@ -314,17 +314,12 @@ def test_derived_sql_views_arithmetic_control(conn):
         ('000001.SZ','20261009','股东大会通过',0.8)
     """)
     conn.execute("""
-        INSERT INTO stk_holdertrade (ts_code,ann_date,in_de,change_vol,change_ratio) VALUES
-        ('000001.SZ','20261009','IN',100,2),
-        ('000001.SZ','20261009','DE',50,1)
-    """)
-    conn.execute("""
         INSERT INTO top_inst (ts_code,trade_date,exalter,buy,net_buy) VALUES
         ('000001.SZ','20261009','机构专用',12,8),
         ('000001.SZ','20261009','其他席位',3,-1)
     """)
     assert conn.execute("SELECT cash_div FROM dividend_grid").fetchone()[0] == pytest.approx(0.3)
-    change = conn.execute("SELECT change_vol,change_ratio FROM stk_holdertrade_agg").fetchone()
-    assert tuple(change) == pytest.approx((50.0, 1.0))
+    # stk_holdertrade_agg 段 2026-10-24 随视图退役移除（带符号算术控制
+    # 迁至 ddup tests/test_tushare_align.py::test_same_day_merge_semantics）
     institution = conn.execute("SELECT inst_net_buy,inst_buy_rate FROM top_inst_agg").fetchone()
     assert tuple(institution) == pytest.approx((8.0, 0.8))
