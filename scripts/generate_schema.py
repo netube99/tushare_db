@@ -257,6 +257,9 @@ def generate_registry(api_list: list[dict]) -> str:
             frags.append(f', "date_col": "{date_col}"')
         if proj.get("driver"):
             frags.append(f', "driver": {_json.dumps(proj["driver"])}')
+        if "trade_date_refresh_days" in proj:
+            frags.append(
+                f', "trade_date_refresh_days": {proj["trade_date_refresh_days"]}')
         if upsert.get("null_pk_keep"):
             frags.append(', "null_pk_keep": True')
         if upsert.get("partition_key"):

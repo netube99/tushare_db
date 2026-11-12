@@ -62,6 +62,25 @@ def test_refresh_fetches_same_count_correction_but_resume_reuses_cache(conn, tmp
     assert len(calls) == 2
 
 
+def test_trade_date_refresh_window_rechecks_only_recent_successes(conn, monkeypatch):
+    entry = next(e for e in REGISTRY if e["api"] == "stk_factor_pro")
+    entry = {**entry, "trade_date_refresh_days": 7}
+    dates = ["20261009", "20261016"]
+    conn.executemany("INSERT INTO trade_cal VALUES ('SSE',?,1,NULL)", [(d,) for d in dates])
+    conn.executemany(
+        "INSERT INTO pull_log(table_name,date_val,ok) VALUES ('stk_factor_pro',?,1)",
+        [(d,) for d in dates],
+    )
+    now = datetime(2026, 10, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr(m, "beijing_now", lambda: now)
+    calls = []
+    monkeypatch.setattr(m, "_pull_once", lambda *a, **k: calls.append((a[3], k)) or True)
+
+    m._run_trade_date_strategy(conn, object(), entry, "20261009", "20261016")
+
+    assert calls == [("20261016", {"force_refresh": True, "trade_date": "20261016"})]
+
+
 def test_completed_domain_history_uses_one_state_query(conn):
     entry = next(e for e in REGISTRY if e["api"] == "index_weight")
     months = [f"{y}{mo:02}" for y in range(2018, 2027) for mo in range(1, 13)

@@ -43,7 +43,7 @@ REGISTRY = [
     {"api": "kpl_concept_cons", "table": "kpl_concept_cons", "primary_key": ["ts_code", "con_code", "trade_date"], "date_col": "trade_date"},
     {"api": "top_list", "table": "top_list", "primary_key": [], "date_col": "trade_date", "partition_key": "trade_date"},
     {"api": "cyq_perf", "table": "cyq_perf", "date_col": "trade_date"},
-    {"api": "stk_factor_pro", "table": "stk_factor_pro", "date_col": "trade_date"},
+    {"api": "stk_factor_pro", "table": "stk_factor_pro", "date_col": "trade_date", "trade_date_refresh_days": 7},
     {"api": "bak_daily", "table": "bak_daily", "date_col": "trade_date"},
     {"api": "stk_limit", "table": "stk_limit", "date_col": "trade_date"},
     {"api": "dividend", "table": "dividend", "primary_key": [], "date_col": "ann_date", "driver": {"source_table": "stk_factor_pro", "source_column": "ts_code", "date_mode": "once", "refresh_days": 7, "refresh_batch_size": 1000}, "partition_key": "ts_code", "dedupe_cols": ["ts_code", "ann_date", "div_proc"]},

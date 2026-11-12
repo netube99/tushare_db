@@ -320,7 +320,11 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
                 upsert_df(conn, "trade_cal", df)
             iter_dates = _cal_query(conn, since=since, until=until)
 
-    # 查出已完成(ok=1)和确认空(ok=2)的日期，都不重拉
+    # 成功日期的有限复验窗口用于覆盖上游延迟发布；不代表完整性证明。
+    refresh_days = entry.get("trade_date_refresh_days", 0)
+    if not isinstance(refresh_days, int) or refresh_days < 0:
+        raise ValueError(f"{table} trade_date_refresh_days 必须为非负整数")
+    retry_cutoff = beijing_now().date() - timedelta(days=refresh_days)
     done_dates = {r[0] for r in conn.execute(
         'SELECT date_val FROM pull_log WHERE table_name=? AND ok IN (1,2)', (table,)
     ).fetchall()}
@@ -328,12 +332,14 @@ def _run_trade_date_strategy(conn, dc, entry, since: str | None = None, until: s
     total = len(iter_dates)
     filled = 0
     for i, (td,) in enumerate(iter_dates):
-        if td in done_dates:
+        recheck = refresh_days > 0 and td in done_dates and datetime.strptime(
+            td, "%Y%m%d").date() >= retry_cutoff
+        if td in done_dates and not recheck:
             filled += 1
             continue
         logger.info(f"{_pfx}{api_name}({date_col}={td}) → {table} [{i+1}/{total}]")
         res = _pull_once(conn, dc, entry, td, "trade_date", _pfx,
-                         force_refresh=force_refresh, **{date_col: td})
+                         force_refresh=force_refresh or recheck, **{date_col: td})
         if res is None:
             break
         filled += 1
@@ -1107,6 +1113,16 @@ def _cmd_daily(conn, dc, args, config, run_id, t_start):
         table = entry["table"]
         dc_col = entry.get("date_col")
         strategy = _get_date_params(entry)
+
+        refresh_days = entry.get("trade_date_refresh_days", 0)
+        if refresh_days:
+            refresh_since = (datetime.strptime(target_str, "%Y%m%d").date()
+                             - timedelta(days=refresh_days)).strftime("%Y%m%d")
+            logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 复验窗口 {refresh_since} → {target_str}")
+            _dispatch_strategy(conn, dc, entry, strategy, refresh_since, target_str,
+                               progress=p)
+            logger.info(f"[daily] [{p[0]}/{p[1]}] {table}: 完成")
+            continue
 
         if entry.get("driver") and strategy.get("date_mode") == "once":
             # once 域表（如 dividend 逐股全量）：MAX(date_col) 无法反映新域值，

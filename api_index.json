@@ -16824,34 +16824,14 @@
         "description": "动向指标PDI(前复权)"
       },
       {
-        "name": "downdays_bfq",
+        "name": "downdays",
         "type": "float",
-        "description": "连跌天数(不复权)"
+        "description": "连跌天数"
       },
       {
-        "name": "downdays_hfq",
+        "name": "updays",
         "type": "float",
-        "description": "连跌天数(后复权)"
-      },
-      {
-        "name": "downdays_qfq",
-        "type": "float",
-        "description": "连跌天数(前复权)"
-      },
-      {
-        "name": "updays_bfq",
-        "type": "float",
-        "description": "连涨天数(不复权)"
-      },
-      {
-        "name": "updays_hfq",
-        "type": "float",
-        "description": "连涨天数(后复权)"
-      },
-      {
-        "name": "updays_qfq",
-        "type": "float",
-        "description": "连涨天数(前复权)"
+        "description": "连涨天数"
       },
       {
         "name": "dpo_bfq",
@@ -17034,34 +17014,14 @@
         "description": "肯特纳交易通道上轨(前复权)"
       },
       {
-        "name": "lowdays_bfq",
+        "name": "lowdays",
         "type": "float",
-        "description": "最低价周期(不复权)"
+        "description": "最低价周期(LOWRANGE)"
       },
       {
-        "name": "lowdays_hfq",
+        "name": "topdays",
         "type": "float",
-        "description": "最低价周期(后复权)"
-      },
-      {
-        "name": "lowdays_qfq",
-        "type": "float",
-        "description": "最低价周期(前复权)"
-      },
-      {
-        "name": "topdays_bfq",
-        "type": "float",
-        "description": "最高价周期(不复权)"
-      },
-      {
-        "name": "topdays_hfq",
-        "type": "float",
-        "description": "最高价周期(后复权)"
-      },
-      {
-        "name": "topdays_qfq",
-        "type": "float",
-        "description": "最高价周期(前复权)"
+        "description": "最高价周期(TOPRANGE)"
       },
       {
         "name": "macd_bfq",
@@ -17453,7 +17413,8 @@
         "effective_rate": 30,
         "recommended_interval_ms": 2500,
         "note": "频率限制30/min（低于标准500）"
-      }
+      },
+      "trade_date_refresh_days": 7
     }
   },
   {
